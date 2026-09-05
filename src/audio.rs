@@ -5,7 +5,8 @@
 //! с частотой 16 кГц и уровнем в диапазоне [-1.0, 1.0]. Этот модуль делает
 //! конвертацию, убирает тишину и выравнивает громкость.
 
-const TARGET_RATE: f64 = 16_000.0;
+/// Частота, на которую Whisper ожидает моно-аудио: 16 кГц.
+pub const TARGET_RATE: f64 = 16_000.0;
 
 /// Полуширина sinc-ядра фильтра-пересэмплера (в сэмплах исходной частоты).
 /// Больше отводов — точнее срез спектра, но медленнее. 16 отводов — хороший
@@ -106,12 +107,18 @@ fn resample_sinc(src: &[f32], from: f64, to: f64) -> Vec<f32> {
 /// Обрезает молчание в начале и в конце записи.
 ///
 /// Порог — относительный (5% от самого громкого окна), поэтому не зависит
-/// от уровня микрофона и не «вырезает» тихую речь. Если запись почти
+/// от уровня микрофона и не «вырезает» тихую речь. Порог снизу ограничен
+/// мягкой абсолютной величиной (-48 дБ), а по бокам оставляется небольшой
+/// запас, чтобы не «срезать» мягкие окончания слов (последний слог «дела»
+/// тише, чем гласные середины, но это ещё речь). Если запись почти
 /// полностью состоит из тишины или речь занимает меньше пятой части —
 /// ничего не обрезаем, чтобы не испортить короткий клип.
 pub fn trim_silence(audio: &[f32]) -> &[f32] {
     const WINDOW: usize = 320; // 20 мс при 16 кГц
     const MIN_SPEECH_FRACTION: usize = 5; // речь должна занимать >= 1/5 клипа
+    // Запас по одному окну (20 мс) с каждой стороны границы речи: эти окна
+    // почти наверняка содержат хвост последней гласной или призвук начала.
+    const EDGE_PAD_WINDOWS: usize = 1;
 
     let windows = audio.len() / WINDOW;
     if windows < 4 {
@@ -132,7 +139,9 @@ pub fn trim_silence(audio: &[f32]) -> &[f32] {
         return audio;
     }
 
-    let threshold = (max_rms * 0.05).min(0.008); // минимум -42 дБ
+    // Абсолютный потолок порога — -48 дБ (вместо прежних -42 дБ): не режем
+    // тихие, но ещё слышимые окончания слов на громких записях.
+    let threshold = (max_rms * 0.05).min(0.004);
     let mut start = 0;
     while start < windows && rms[start] < threshold {
         start += 1;
@@ -145,7 +154,9 @@ pub fn trim_silence(audio: &[f32]) -> &[f32] {
     // Речь должна занимать хотя бы пятую часть клипа, иначе это короткий
     // отрывок — лучше отдать весь кусок целиком.
     if end - start >= windows / MIN_SPEECH_FRACTION {
-        &audio[start * WINDOW..end * WINDOW]
+        let start = start.saturating_sub(EDGE_PAD_WINDOWS) * WINDOW;
+        let end = (end + EDGE_PAD_WINDOWS).min(windows) * WINDOW;
+        &audio[start..end]
     } else {
         audio
     }
@@ -201,7 +212,7 @@ pub fn normalize_audio(audio: &mut [f32]) {
     // Средний RMS — если запись почти целиком тишина, не трогаем её.
     let sum: f32 = audio.iter().map(|x| x * x).sum();
     let avg_rms = (sum / audio.len() as f32).sqrt();
-    if avg_rms < 0.005 {
+    if avg_rms < 0.003 {
         return;
     }
 
@@ -210,9 +221,12 @@ pub fn normalize_audio(audio: &mut [f32]) {
         return;
     }
 
-    // Целевой пик ~ -6 дБ; усиливаем максимум в 4 раза (~ +12 дБ).
+    // Целевой пик ~ -6 дБ; усиление до 8x (~ +18 дБ). Тихая, но реальная речь
+    // (например, при «Усилении входа» ниже 1.0 или слабом микрофоне) должна
+    // дойти до Whisper нормальным уровнем, а не «шёпотом», на котором модель
+    // выдумывает текст вместо распознавания.
     let target_peak: f32 = 0.5;
-    let gain = (target_peak / peak).clamp(1.0, 4.0);
+    let gain = (target_peak / peak).clamp(1.0, 8.0);
 
     if (gain - 1.0).abs() < 0.05 {
         return;
@@ -221,6 +235,41 @@ pub fn normalize_audio(audio: &mut [f32]) {
     for sample in audio.iter_mut() {
         *sample = (*sample * gain).clamp(-1.0, 1.0);
     }
+}
+
+/// Есть ли в записи заметная энергия/речь?
+///
+/// Тихие и «пустые» записи (быстрое нажатие клавиши, фоновый шум, глубокий
+/// молчание) не содержат речи, но Whisper на них умеет «галлюцинировать»
+/// (например, «Продолжение следует»). Эта функция помогает отличить
+/// реальную речь от тишины: если максимум по окнам RMS ниже порога —
+/// речь не считаем распознанной.
+pub fn has_speech_energy(audio: &[f32]) -> bool {
+    const WINDOW: usize = 320; // 20 мс при 16 кГц
+
+    if audio.is_empty() {
+        return false;
+    }
+
+    let windows = audio.len() / WINDOW;
+    if windows == 0 {
+        // Слишком короткий клип — оцениваем по всему буферу целиком.
+        let sum: f32 = audio.iter().map(|x| x * x).sum();
+        return (sum / audio.len() as f32).sqrt() >= 0.002;
+    }
+
+    let mut max_rms = 0.0f32;
+    for w in 0..windows {
+        let seg = &audio[w * WINDOW..(w + 1) * WINDOW];
+        let sum: f32 = seg.iter().map(|x| x * x).sum();
+        let rms = (sum / WINDOW as f32).sqrt();
+        if rms > max_rms {
+            max_rms = rms;
+        }
+    }
+
+    // Как и в trim_silence: ниже этого RMS считаем запись «тишиной».
+    max_rms >= 0.002
 }
 
 #[cfg(test)]
@@ -252,10 +301,12 @@ mod tests {
         }
         let trimmed = trim_silence(&audio);
         let non_silent = trimmed.iter().filter(|&&x| x > 0.001).count();
-        // Вся «речь» сохранена, с обеих сторон убрана тишина (округляется до
-        // границ 20-мс окон, поэтому общая длина чуть больше самой речи).
+        // Вся «речь» сохранена, с обеих сторон оставлен запас по одному окну
+        // (20 мс), чтобы не срезать мягкие окончания слов.
         assert_eq!(non_silent, 1600);
-        assert_eq!(trimmed.len(), 1920);
+        assert_eq!(trimmed.len(), 2560);
+        // Запас захватывает тишину с каждой стороны ровно на одно окно.
+        assert_eq!(&trimmed[..320], &audio[320..640]);
     }
 
     #[test]
@@ -280,13 +331,9 @@ mod tests {
     fn noise_reduction_lowers_quiet_section() {
         let mut audio: Vec<f32> = Vec::new();
         // Тихий фон (шум) в начале.
-        for _ in 0..800 {
-            audio.push(0.01);
-        }
+        audio.extend(std::iter::repeat_n(0.01, 800));
         // Громкая «речь» в середине.
-        for _ in 0..800 {
-            audio.push(0.5);
-        }
+        audio.extend(std::iter::repeat_n(0.5, 800));
         let quiet_before: f32 = audio[..800].iter().map(|x| x.abs()).sum();
         apply_noise_reduction(&mut audio);
         let quiet_after: f32 = audio[..800].iter().map(|x| x.abs()).sum();
@@ -294,6 +341,27 @@ mod tests {
         let speech_after: f32 = audio[800..].iter().map(|x| x.abs()).sum();
         // Тихий участок заметно обрезан, а «речь» почти не тронута.
         assert!(quiet_after < quiet_before * 0.5, "шум должен снизиться");
-        assert!(speech_after > speech_before * 0.5, "речь должна сохраниться");
+        assert!(
+            speech_after > speech_before * 0.5,
+            "речь должна сохраниться"
+        );
+    }
+
+    #[test]
+    fn silence_has_no_speech_energy() {
+        // Пустая и тихая запись — речи нет (например, быстрое нажатие клавиши).
+        assert!(!has_speech_energy(&[]));
+        let silent = vec![0.0f32; 6400]; // 400 мс тишины
+        assert!(!has_speech_energy(&silent));
+    }
+
+    #[test]
+    fn loud_audio_has_speech_energy() {
+        // Громкая «речь» — энергия есть.
+        let mut audio = vec![0.0f32; 6400];
+        for s in &mut audio[1600..3200] {
+            *s = 0.4;
+        }
+        assert!(has_speech_energy(&audio));
     }
 }

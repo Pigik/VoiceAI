@@ -24,9 +24,8 @@ rem Библиотеки CUDA — без них whisper-rs не запустит
 for %%f in (cublas64_1*.dll cublasLt64_1*.dll cudart64_1*.dll) do (
     if exist "%OUT%\%%f" copy /y "%OUT%\%%f" "%STAGE%\" >nul
 )
-rem Модели кладём в архив, только если они уже есть в target\release.
+rem Модель кладём в архив, только если она уже есть в target\release.
 if exist "%OUT%\ggml-large-v3-turbo.bin" copy /y "%OUT%\ggml-large-v3-turbo.bin" "%STAGE%\" >nul
-if exist "%OUT%\ggml-large-v3-turbo-q5_0.bin" copy /y "%OUT%\ggml-large-v3-turbo-q5_0.bin" "%STAGE%\" >nul
 
 powershell -NoProfile -Command "Compress-Archive -Path '%STAGE%' -DestinationPath '%~dp0dist\VoiceAI-windows-x64.zip' -Force"
 if errorlevel 1 exit /b 1

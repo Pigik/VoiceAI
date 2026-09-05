@@ -40,8 +40,9 @@ whisper-rs = { version = "0.16", features = ["cuda"] }
 tray-icon = "0.24"
 # winreg — автозапуск через реестр Windows (ключ HKCU\...\Run).
 winreg = "0.55"
-# windows-sys — диалог «приложение уже запущено» (MessageBox).
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+# windows-sys — диалог «приложение уже запущено» (MessageBox) и ввод текста
+# через SendInput с KEYEVENTF_UNICODE (вставка без буфера обмена).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"] }

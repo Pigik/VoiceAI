@@ -10,17 +10,13 @@ setlocal
 
 set "BASE=https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 set "MAIN=ggml-large-v3-turbo.bin"
-set "FALLBACK=ggml-large-v3-turbo-q5_0.bin"
 set "MAIN_SHA256=1FC70F774D38EB169993AC391EEA357EF47C88757EF72EE5943879B7E8E2BC69"
-set "FALLBACK_SHA256=394221709CD5AD1F40C46E6031CA61BCE88931E6E088C188294C6D5A55FFA7E2"
 
 call :ensure_model "%MAIN%" "%MAIN_SHA256%"
 if errorlevel 1 exit /b 1
-call :ensure_model "%FALLBACK%" "%FALLBACK_SHA256%"
-if errorlevel 1 exit /b 1
 
 echo.
-echo Готово: обе модели скачаны и проверены по SHA-256.
+echo Готово: модель скачана и проверена по SHA-256.
 exit /b 0
 
 :ensure_model

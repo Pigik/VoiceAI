@@ -19,9 +19,6 @@ OUT="target/release"
 if [ -f "ggml-large-v3-turbo.bin" ]; then
     cp "ggml-large-v3-turbo.bin" "$OUT/"
 fi
-if [ -f "ggml-large-v3-turbo-q5_0.bin" ]; then
-    cp "ggml-large-v3-turbo-q5_0.bin" "$OUT/"
-fi
 
 echo
 echo "Готово. Запускайте $OUT/VoiceAI"

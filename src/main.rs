@@ -25,9 +25,6 @@ const LOG_FILE: &str = "voiceai.log";
 /// с программой, в текущей папке, в папке models/ или по переменной
 /// окружения WHISPER_MODEL (путь из настроек имеет приоритет).
 const MODEL_FILE: &str = "ggml-large-v3-turbo.bin";
-/// Запасная модель (меньше по размеру). Используется, если основная
-/// модель не найдена ни в одном из мест поиска.
-const FALLBACK_MODEL_FILE: &str = "ggml-large-v3-turbo-q5_0.bin";
 
 /// Число параллельных потоков для Whisper. Основные вычисления уходят на
 /// видеокарту (CUDA), а CPU-часть (токенизация, часть декодов) разгоняем
@@ -239,7 +236,10 @@ impl eframe::App for DictophoneApp {
                 .collapsible(false)
                 .resizable(false)
                 .min_width(420.0)
+                .default_height(440.0)
+                .max_height(440.0)
                 .show(ui.ctx(), |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
                     // Выбор устройства ввода.
                     let selected_label = new_settings
                         .input_device
@@ -274,7 +274,7 @@ impl eframe::App for DictophoneApp {
                             .logarithmic(true),
                     );
                     ui.add_space(2.0);
-                    ui.label("1.0 — без изменений, больше — громче");
+                    ui.label("1.0 — без изменений. Значения ниже 1.0 делают запись тише и ухудшают распознавание");
 
                     ui.add_space(10.0);
                     // Шумоподавление (C-16).
@@ -411,6 +411,7 @@ impl eframe::App for DictophoneApp {
                     {
                         new_settings = Settings::default();
                     }
+                    });
                 });
 
             // Применяем изменения настроек, синхронизируем автозапуск и сохраняем.
@@ -455,6 +456,58 @@ enum TranscriptionJob {
         /// Применять ли подавление фонового шума при подготовке аудио.
         noise_reduction: bool,
     },
+}
+
+/// Результат расшифровки с диагностикой для журнала.
+///
+/// Помимо самого текста возвращаем, что «услышала» модель до пост-обработки,
+/// длительность записи и уровень сигнала: по этим данным в `voiceai.log`
+/// всегда видно, была ли запись тихой/обрезанной или сбился сам Whisper.
+struct TranscribeOutcome {
+    /// Путь к сохранённому .txt.
+    txt_path: String,
+    /// Число слов в итоговом тексте (0 — речи не распознано).
+    word_count: usize,
+    /// Итоговый текст после пост-обработки (тот, что вставляется).
+    text: String,
+    /// «Сырой» текст из Whisper до пост-обработки.
+    raw_text: String,
+    /// Длительность аудио (после подготовки), которое слушал Whisper, в секундах.
+    audio_secs: f64,
+    /// Максимальный уровень сигнала (0..=1) после подготовки аудио.
+    signal_level: f32,
+}
+
+/// Пишет пустой .txt и возвращает результат «речи не распознано»
+/// (пустой текст и 0 слов): вставка не происходит.
+fn no_speech_outcome(
+    wav_path: &str,
+    audio: &[f32],
+) -> Result<TranscribeOutcome, Box<dyn std::error::Error>> {
+    let txt_path = replace_wav_extension(wav_path, "txt");
+    write_text_file(&txt_path, "")?;
+    Ok(TranscribeOutcome {
+        txt_path,
+        word_count: 0,
+        text: String::new(),
+        raw_text: String::new(),
+        audio_secs: audio.len() as f64 / audio::TARGET_RATE,
+        signal_level: peak_amplitude(audio),
+    })
+}
+
+/// Максимальный абсолютный сэмпл клипа (для журнала диагностики).
+fn peak_amplitude(audio: &[f32]) -> f32 {
+    audio.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()))
+}
+
+/// Сырой текст Whisper для журнала: пустую строку показываем прочерком.
+fn raw_display(raw: &str) -> &str {
+    if raw.trim().is_empty() {
+        "—"
+    } else {
+        raw.trim()
+    }
 }
 
 fn main() -> eframe::Result {
@@ -850,35 +903,44 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
             }));
 
             match result {
-                Ok(Ok((txt_path, 0, _))) => {
-                    // Запись была, но речи в ней не распознано.
-                    append_log(
-                        &state,
-                        format!(
-                            "Записано {wav_path}, но речь не распознана: запись слишком тихая или короткая. Текст сохранён в {txt_path}."
-                        ),
-                    );
-                }
-                Ok(Ok((txt_path, words, text))) => {
-                    append_log(
-                        &state,
-                        format!(
-                            "Расшифровка готова: {txt_path} (слов: {words}). Запись: {wav_path}"
-                        ),
-                    );
-                    // Вставляем распознанный текст в приложение, где стоит курсор
-                    // (Win32: буфер обмена + Ctrl+V, поэтому работает с любым окном).
-                    #[cfg(target_os = "windows")]
-                    if !text.trim().is_empty() && words > 0 {
-                        match insert::insert_text_at_cursor(&text) {
-                            Ok(_) => append_log(
-                                &state,
-                                "Текст вставлен в активное окно (под курсор).".to_string(),
+                Ok(Ok(outcome)) => {
+                    if outcome.word_count == 0 {
+                        append_log(
+                            &state,
+                            format!(
+                                "Записано {wav_path}, но речь не распознана: запись слишком тихая, короткая или без речевой энергии (длина {:.2} с, уровень {:.3}). Текст сохранён в {}.",
+                                outcome.audio_secs, outcome.signal_level, outcome.txt_path
                             ),
-                            Err(err) => append_log(
-                                &state,
-                                format!("Не удалось вставить текст в окно: {err}"),
+                        );
+                    } else {
+                        append_log(
+                            &state,
+                            format!(
+                                "Расшифровка готова: {} (слов: {}). Запись: {} (длина {:.2} с, уровень {:.3}).\n  Сырой текст Whisper: {}\n  После обработки: {}",
+                                outcome.txt_path,
+                                outcome.word_count,
+                                wav_path,
+                                outcome.audio_secs,
+                                outcome.signal_level,
+                                raw_display(&outcome.raw_text),
+                                outcome.text,
                             ),
+                        );
+                        // Вставляем распознанный текст в приложение, где стоит курсор
+                        // (Win32: SendInput с KEYEVENTF_UNICODE — работает с любым окном
+                        // и не трогает буфер обмена пользователя).
+                        #[cfg(target_os = "windows")]
+                        if !outcome.text.trim().is_empty() && outcome.word_count > 0 {
+                            match insert::insert_text_at_cursor(&outcome.text) {
+                                Ok(_) => append_log(
+                                    &state,
+                                    "Текст вставлен в активное окно (под курсор).".to_string(),
+                                ),
+                                Err(err) => append_log(
+                                    &state,
+                                    format!("Не удалось вставить текст в окно: {err}"),
+                                ),
+                            }
                         }
                     }
                 }
@@ -906,7 +968,7 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
 
 /// Расшифровывает запись через Whisper и записывает текст в .txt рядом с WAV.
 ///
-/// Возвращает путь к текстовому файлу, число слов и сам текст
+/// Возвращает результат с текстом, числом слов и диагностикой
 /// (0 слов — если Whisper не услышал речи). Если пост-обработка не
 /// справилась, пишется «сырой» текст Whisper, чтобы пользователь не
 /// остался вообще без расшифровки.
@@ -923,7 +985,7 @@ fn transcribe_and_save(
     model_override: Option<&str>,
     language: &str,
     context: &mut Option<WhisperContext>,
-) -> Result<(String, usize, String), Box<dyn std::error::Error>> {
+) -> Result<TranscribeOutcome, Box<dyn std::error::Error>> {
     // Загружаем модель при первом использовании и переиспользуем её дальше.
     let ctx = match context {
         Some(ctx) => ctx,
@@ -960,6 +1022,22 @@ fn transcribe_and_save(
         audio::apply_noise_reduction(&mut audio);
     }
     audio::normalize_audio(&mut audio);
+
+    // Быстрое нажатие/отпускание клавиши даёт почти пустую запись: речи нет,
+    // но Whisper иногда «галлюцинирует» («Продолжение следует»). Если в звуке
+    // нет энергии — не вставляем ничего: пишем пустой txt и возвращаем 0 слов.
+    if !audio::has_speech_energy(&audio) {
+        return no_speech_outcome(wav_path, &audio);
+    }
+
+    // Очень короткая запись — это не слово, а щелчок/дребезг клавиши или
+    // случайный звук. Whisper на таком обрывке «додумывает» правдоподобную
+    // фразу (например, вместо нажатой «как дела» — выдуманную «как же я
+    // ловил?»), поэтому отдаём модели только осмысленно длинный клип.
+    const MIN_SPEECH_SECONDS: f64 = 0.25;
+    if audio.len() as f64 / audio::TARGET_RATE < MIN_SPEECH_SECONDS {
+        return no_speech_outcome(wav_path, &audio);
+    }
 
     let mut state = ctx.create_state()?;
 
@@ -1013,7 +1091,14 @@ fn transcribe_and_save(
     let txt_path = replace_wav_extension(wav_path, "txt");
     write_text_file(&txt_path, &final_text)?;
 
-    Ok((txt_path, word_count, final_text))
+    Ok(TranscribeOutcome {
+        txt_path,
+        word_count,
+        text: final_text,
+        raw_text: raw,
+        audio_secs: audio.len() as f64 / audio::TARGET_RATE,
+        signal_level: peak_amplitude(&audio),
+    })
 }
 
 /// Пишет текст в файл и проверяет, что запись действительно прошла.
@@ -1040,9 +1125,8 @@ fn replace_wav_extension(path: &str, new_ext: &str) -> String {
 /// Ищет файл модели Whisper в нескольких стандартных местах.
 ///
 /// Порядок поиска: путь из настроек пользователя, переменная WHISPER_MODEL,
-/// папка с исполняемым файлом, текущая папка, папка models/. Для каждой папки
-/// сначала пробуется основной файл модели (обычно более качественная точная
-/// версия), затем запасная. Возвращает первый найденный путь.
+/// папка с исполняемым файлом, текущая папка, папка models/. Возвращает
+/// первый найденный путь.
 fn resolve_model_path(model_override: Option<&str>) -> Option<String> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
 
@@ -1057,13 +1141,10 @@ fn resolve_model_path(model_override: Option<&str>) -> Option<String> {
         && let Some(exe_dir) = exe_path.parent()
     {
         candidates.push(exe_dir.join(MODEL_FILE));
-        candidates.push(exe_dir.join(FALLBACK_MODEL_FILE));
     }
     candidates.push(std::path::PathBuf::from(MODEL_FILE));
-    candidates.push(std::path::PathBuf::from(FALLBACK_MODEL_FILE));
     let models_dir = std::path::PathBuf::from("models");
     candidates.push(models_dir.join(MODEL_FILE));
-    candidates.push(models_dir.join(FALLBACK_MODEL_FILE));
 
     candidates
         .into_iter()
@@ -1196,9 +1277,13 @@ fn capture_stream(
     let stream = match config.sample_format() {
         // 32-битный звук с плавающей точкой — самый распространённый на Windows.
         // Конвертируем f32 в i16 прямо в потоке захвата.
-        SampleFormat::F32 => build_f32_stream(&device, &config.into(), channels, tx, state.clone())?,
+        SampleFormat::F32 => {
+            build_f32_stream(&device, &config.into(), channels, tx, state.clone())?
+        }
         // 16-битные целые — используются как есть.
-        SampleFormat::I16 => build_i16_stream(&device, &config.into(), channels, tx, state.clone())?,
+        SampleFormat::I16 => {
+            build_i16_stream(&device, &config.into(), channels, tx, state.clone())?
+        }
         other => {
             return Err(format!("Неподдерживаемый формат сэмплов: {other:?}").into());
         }
@@ -1233,29 +1318,31 @@ fn build_f32_stream(
         if matches!(err, cpal::StreamError::DeviceNotAvailable) {
             append_log(
                 &state,
-                "Микрофон недоступен: устройство отключено или занято другим приложением.".to_string(),
+                "Микрофон недоступен: устройство отключено или занято другим приложением."
+                    .to_string(),
             );
         } else {
             append_log(&state, format!("Ошибка потока записи: {err}"));
         }
     };
 
-    let stream = device.build_input_stream(
-        config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            // Группируем сэмплы по `channels` штук (один аудио-фрейм).
-            for frame in data.chunks(channels) {
-                // Усредняем все каналы фрейма в один моно-сэмпл.
-                let average = frame.iter().sum::<f32>() / channels as f32;
-                // Масштабируем на максимум i16 и округляем до целого.
-                let sample_i16 = (average.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                let _ = tx.send(sample_i16);
-            }
-        },
-        err_fn,
-        None,
-    )
-    .map_err(describe_build_error)?;
+    let stream = device
+        .build_input_stream(
+            config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // Группируем сэмплы по `channels` штук (один аудио-фрейм).
+                for frame in data.chunks(channels) {
+                    // Усредняем все каналы фрейма в один моно-сэмпл.
+                    let average = frame.iter().sum::<f32>() / channels as f32;
+                    // Масштабируем на максимум i16 и округляем до целого.
+                    let sample_i16 = (average.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                    let _ = tx.send(sample_i16);
+                }
+            },
+            err_fn,
+            None,
+        )
+        .map_err(describe_build_error)?;
 
     Ok(stream)
 }
@@ -1276,29 +1363,31 @@ fn build_i16_stream(
         if matches!(err, cpal::StreamError::DeviceNotAvailable) {
             append_log(
                 &state,
-                "Микрофон недоступен: устройство отключено или занято другим приложением.".to_string(),
+                "Микрофон недоступен: устройство отключено или занято другим приложением."
+                    .to_string(),
             );
         } else {
             append_log(&state, format!("Ошибка потока записи: {err}"));
         }
     };
 
-    let stream = device.build_input_stream(
-        config,
-        move |data: &[i16], _: &cpal::InputCallbackInfo| {
-            // Группируем сэмплы по `channels` штук (один аудио-фрейм).
-            for frame in data.chunks(channels) {
-                // Усредняем каналы в один моно-сэмпл, суммируя в i32,
-                // чтобы избежать переполнения.
-                let sum: i32 = frame.iter().map(|&s| s as i32).sum();
-                let average = (sum / channels as i32) as i16;
-                let _ = tx.send(average);
-            }
-        },
-        err_fn,
-        None,
-    )
-    .map_err(describe_build_error)?;
+    let stream = device
+        .build_input_stream(
+            config,
+            move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                // Группируем сэмплы по `channels` штук (один аудио-фрейм).
+                for frame in data.chunks(channels) {
+                    // Усредняем каналы в один моно-сэмпл, суммируя в i32,
+                    // чтобы избежать переполнения.
+                    let sum: i32 = frame.iter().map(|&s| s as i32).sum();
+                    let average = (sum / channels as i32) as i16;
+                    let _ = tx.send(average);
+                }
+            },
+            err_fn,
+            None,
+        )
+        .map_err(describe_build_error)?;
 
     Ok(stream)
 }
@@ -1313,8 +1402,7 @@ fn describe_default_config_error(err: cpal::DefaultStreamConfigError) -> String 
                 .to_string()
         }
         E::StreamTypeNotSupported => {
-            "Устройство не поддерживает захват звука. Выберите другое устройство ввода."
-                .to_string()
+            "Устройство не поддерживает захват звука. Выберите другое устройство ввода.".to_string()
         }
         E::BackendSpecific { err } => {
             let message = err.description;

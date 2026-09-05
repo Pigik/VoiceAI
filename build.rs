@@ -36,13 +36,12 @@ fn main() {
     copy_cuda_dlls(profile_dir);
 }
 
-/// Копирует файлы моделей Whisper из корня проекта рядом с exe.
+/// Копирует модель Whisper из корня проекта рядом с exe.
 fn copy_models(manifest: &Path, dest: &Path) {
-    for name in ["ggml-large-v3-turbo.bin", "ggml-large-v3-turbo-q5_0.bin"] {
-        let src = manifest.join(name);
-        if src.is_file() {
-            let _ = fs::copy(&src, dest.join(name));
-        }
+    let name = "ggml-large-v3-turbo.bin";
+    let src = manifest.join(name);
+    if src.is_file() {
+        let _ = fs::copy(&src, dest.join(name));
     }
 }
 

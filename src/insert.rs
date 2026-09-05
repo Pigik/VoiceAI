@@ -1,51 +1,120 @@
 //! Вставка распознанного текста в приложение, где стоит курсор.
 //!
-//! Текст помещается в системный буфер обмена, после чего имитируется
-//! нажатие Ctrl+V. Windows сама вставляет текст в позицию курсора
-//! (или заменяет выделенный текст) активного окна. Такой подход
-//! работает с любым приложением: браузером, Word, блокнотом и т.п.
+//! Текст вводится напрямую через `SendInput` с флагом `KEYEVENTF_UNICODE`:
+//! каждый символ уходит в систему ввода как обычное нажатие клавиши. Такой
+//! способ работает с любым приложением: браузером, Word, блокнотом и т.п.
+//!
+//! Буфер обмена при этом **не используется вообще**:
+//! - нет гонки «восстановленный старый буфер перекрывает текст» — вставляется
+//!   именно то, что нужно;
+//! - буфер пользователя остаётся нетронутым (L-03) — нечего сохранять и
+//!   восстанавливать, не нужна задержка на ожидание чтения буфера приложением;
+//! - пустой текст не «печатается» — ничего не вставляется (L-04).
+//!
+//! Многострочный текст вводится как есть: переводы строк превращаются
+//! в нажатие Enter (L-07).
 
 #![cfg(target_os = "windows")]
 
 use std::sync::Mutex;
 
-// Виртуальные коды клавиш и флаги для keybd_event (WinUser.h).
-const VK_CONTROL: u8 = 0x11;
-const VK_V: u8 = 0x56;
-const KEYEVENTF_KEYUP: u32 = 0x0002;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
+    VK_RETURN,
+};
 
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn keybd_event(b_vk: u8, b_scan: u8, dw_flags: u32, dw_extra_info: usize);
+/// Потокобезопасность нужна, чтобы разные потоки не путали порядок
+/// нажатий при одновременных вставках.
+static INPUT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Событие клавиатуры: либо виртуальная клавиша (`vk`), либо Unicode-символ.
+fn key_event(vk: u16, scan: u16, flags: u32) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
 }
 
-/// Буфер обмена защищаем мьютексом: программа может делать вставки из
-/// нескольких потоков, но к системному буферу Windows доступ только один.
-static CLIPBOARD_LOCK: Mutex<()> = Mutex::new(());
-
-/// Кладёт `text` в буфер обмена и вставляет его в приложение под курсором
-/// через Ctrl+V. Windows сама решает: вставить между словами по позиции
-/// курсора или заменить выделенный текст.
+/// Печатает `text` в приложение под курсором, не трогая буфер обмена.
 ///
 /// Возвращает `Ok(true)` при успехе или сообщение об ошибке.
 pub fn insert_text_at_cursor(text: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    let _guard = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Пустой текст печатать нечего — сразу успех (L-04).
+    if text.is_empty() {
+        return Ok(true);
+    }
 
-    // Кладём текст в буфер обмена и закрываем буфер, чтобы владение не держать.
-    let mut clipboard = arboard::Clipboard::new()?;
-    clipboard.set_text(text.to_string())?;
-    drop(clipboard);
+    let _guard = INPUT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Небольшая пауза, чтобы приложение успело «увидеть» новый буфер.
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    // Для каждого символа — пара событий «нажали / отпустили».
+    // Переходы строк вставляем настоящим Enter, остальное — как Unicode-символ.
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(text.chars().count() * 2);
+    for ch in text.chars() {
+        match ch {
+            '\r' | '\n' => {
+                inputs.push(key_event(VK_RETURN, 0, 0));
+                inputs.push(key_event(VK_RETURN, 0, KEYEVENTF_KEYUP));
+            }
+            c => {
+                inputs.push(key_event(0, c as u16, KEYEVENTF_UNICODE));
+                inputs.push(key_event(0, c as u16, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+            }
+        }
+    }
 
-    // Имитируем Ctrl+V: нажимаем Ctrl, нажимаем V, отпускаем V, отпускаем Ctrl.
-    unsafe {
-        keybd_event(VK_CONTROL, 0, 0, 0);
-        keybd_event(VK_V, 0, 0, 0);
-        keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0);
-        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    let sent = unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
+
+    if sent != inputs.len() as u32 {
+        // Что-то не прошло (например, события отвергнуты защитой от ввода).
+        // Сообщаем об ошибке — поток транскрибации запишет её в журнал.
+        return Err(std::io::Error::last_os_error().into());
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_text_is_noop() {
+        // L-04: пустой текст ничего не вставляет.
+        assert!(insert_text_at_cursor("").is_ok());
+    }
+
+    #[test]
+    fn unicode_event_uses_scan_code() {
+        // Кириллический символ должен уйти как Unicode-скан-код без виртуальной клавиши.
+        let evt = key_event(0, 'А' as u16, KEYEVENTF_UNICODE);
+        unsafe {
+            assert_eq!(evt.Anonymous.ki.wVk, 0);
+            assert_eq!(evt.Anonymous.ki.wScan, 'А' as u16);
+            assert_eq!(evt.Anonymous.ki.dwFlags, KEYEVENTF_UNICODE);
+        }
+    }
+
+    #[test]
+    fn newline_produces_return_key() {
+        // Перевод строки превращается в нажатие Enter (L-07).
+        let evt = key_event(VK_RETURN, 0, 0);
+        unsafe {
+            assert_eq!(evt.Anonymous.ki.wVk, VK_RETURN);
+            assert_eq!(evt.Anonymous.ki.dwFlags, 0);
+        }
+    }
 }

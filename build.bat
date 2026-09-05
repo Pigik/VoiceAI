@@ -52,7 +52,6 @@ for %%f in (cublas64_1*.dll cublasLt64_1*.dll cudart64_1*.dll) do (
 
 rem Кладём модель Whisper рядом с exe, чтобы приложение работало из любой папки.
 if exist "%~dp0ggml-large-v3-turbo.bin" copy /y "%~dp0ggml-large-v3-turbo.bin" "%OUT%" >nul
-if exist "%~dp0ggml-large-v3-turbo-q5_0.bin" copy /y "%~dp0ggml-large-v3-turbo-q5_0.bin" "%OUT%" >nul
 
 echo.
 echo Готово. Запускайте %OUT%\VoiceAI.exe
