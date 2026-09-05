@@ -1,0 +1,50 @@
+[package]
+name = "VoiceAI"
+version = "0.1.0"
+edition = "2024"
+
+# Имя библиотеки в нижнем регистре, чтобы в коде писать `use voiceai::...`.
+[lib]
+name = "voiceai"
+
+[dependencies]
+# cpal — библиотека для захвата звука с микрофона (кроссплатформенная).
+cpal = "0.15"
+# hound — библиотека для записи аудио в формат WAV.
+hound = "3.5"
+# global-hotkey — глобальные горячие клавиши, работают независимо от того,
+# какое окно активно (Windows/macOS/Linux).
+global-hotkey = "0.8"
+
+# eframe/egui — кроссплатформенный GUI (Windows, macOS, Linux).
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+
+# serde/serde_json — сохранение пользовательских настроек в config.json
+# (отдельно от исполняемого файла, поэтому обновление поверх старой версии
+# не сбрасывает конфигурацию).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# arboard — работа с системным буфером обмена (копирование текста).
+arboard = "3"
+
+# whisper-rs — привязки Rust для whisper.cpp (локальная транскрибация голоса).
+# Бэкенд выбирается по платформе:
+#   - Windows: CUDA (вся тяжёлая работа уходит на видеокарту NVIDIA, на RTX 4060
+#     20 сек аудио расшифровывается примерно за 1–2 секунды);
+#   - macOS: Metal (GPU любого Mac, включая Apple Silicon);
+#   - Linux/остальное: CPU (без GPU-ускорения).
+[target.'cfg(target_os = "windows")'.dependencies]
+whisper-rs = { version = "0.16", features = ["cuda"] }
+# tray-icon — иконка приложения в системном трее Windows (состояние записи).
+tray-icon = "0.24"
+# winreg — автозапуск через реестр Windows (ключ HKCU\...\Run).
+winreg = "0.55"
+# windows-sys — диалог «приложение уже запущено» (MessageBox).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+whisper-rs = { version = "0.16" }

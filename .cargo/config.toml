@@ -1,0 +1,14 @@
+# Автоматически подставляет переменные CUDA во все сборочные скрипты (в том
+# числе в build.rs крейта whisper-rs-sys и в автогенерируемые проекты MSBuild,
+# которые запускает CMake). Без этих переменных сборка с CUDA-бэкендом падает
+# даже в свежем терминале.
+#
+# - CUDA_PATH нужен build.rs крейта whisper-rs-sys (вызывает .unwrap()).
+# - CUDA_PATH_V13_3 нужен MSBuild-интеграции CUDA 13.3 («The CUDA Toolkit
+#   directory does not exist»).
+#
+# Пути должны указывать на установленный CUDA Toolkit. При обновлении CUDA,
+# когда номер версии (vXX) изменится, поправьте оба значения.
+[env]
+CUDA_PATH = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
+CUDA_PATH_V13_3 = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
