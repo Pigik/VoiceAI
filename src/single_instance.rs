@@ -19,13 +19,20 @@ impl SingleInstanceGuard {
     /// Пытается занять порт-«метку». При неудаче возвращает понятное
     /// сообщение о том, что приложение уже запущено.
     pub fn acquire() -> Result<Self, String> {
-        let address = format!("127.0.0.1:{GUARD_PORT}");
+        Self::acquire_on(GUARD_PORT)
+    }
+
+    /// То же, что `acquire`, но на указанном порту. Нужно для тестов: они
+    /// занимают свободный временный порт, поэтому детерминированы даже когда
+    /// реальное приложение уже запущено (оно держит `GUARD_PORT`).
+    pub fn acquire_on(port: u16) -> Result<Self, String> {
+        let address = format!("127.0.0.1:{port}");
         match TcpListener::bind(&address) {
             Ok(listener) => Ok(Self {
                 _listener: listener,
             }),
             Err(err) => Err(format!(
-                "Приложение уже запущено (порт {GUARD_PORT} занят: {err}). \
+                "Приложение уже запущено (порт {port} занят: {err}). \
                  Одна копия VoiceAI уже работает — вторая не нужна."
             )),
         }
@@ -35,20 +42,29 @@ impl SingleInstanceGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener as NetTcpListener;
+
+    /// Возвращает временный свободный порт на loopback.
+    fn free_port() -> u16 {
+        let probe = NetTcpListener::bind("127.0.0.1:0").expect("выделить временный порт");
+        probe.local_addr().expect("адрес пробного порта").port()
+    }
 
     /// Пока первая копия держит порт, вторая не может запуститься;
-    /// после закрытия первой порт снова свободен.
+    /// после закрытия первой порт снова свободен. Написан на временном
+    /// порту, чтобы проходить даже при уже запущенном приложении.
     #[test]
     fn second_guard_rejected_until_first_released() {
-        let first = SingleInstanceGuard::acquire().expect("первая копия занимает порт");
-        let second = SingleInstanceGuard::acquire();
+        let port = free_port();
+        let first = SingleInstanceGuard::acquire_on(port).expect("первая копия занимает порт");
+        let second = SingleInstanceGuard::acquire_on(port);
         assert!(
             second.is_err(),
             "вторая копия не должна запускаться, пока жива первая"
         );
         drop(first);
         assert!(
-            SingleInstanceGuard::acquire().is_ok(),
+            SingleInstanceGuard::acquire_on(port).is_ok(),
             "после закрытия первой копии порт снова доступен"
         );
     }

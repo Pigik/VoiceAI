@@ -87,6 +87,20 @@ pub fn insert_text_at_cursor(text: &str) -> Result<bool, Box<dyn std::error::Err
     Ok(true)
 }
 
+/// Кладёт `text` в системный буфер обмена.
+///
+/// Это запасной путь (O-15): если вставка через `SendInput` не удалась
+/// (окно заблокировано, защита от ввода), текст не пропадает — он попадает
+/// в буфер обмена, и пользователь вставляет его вручную (Ctrl+V). Сам
+/// «обычный» путь вставки буфер обмена не использует и не трогает.
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|err| format!("Не удалось открыть буфер обмена: {err}"))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|err| format!("Не удалось записать в буфер обмена: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -53,6 +53,10 @@ fn default_input_gain() -> f32 {
     1.0
 }
 
+fn default_keep_audio() -> bool {
+    true
+}
+
 /// Пользовательские настройки приложения. Сериализуются в JSON в
 /// `config.json` и переживают обновление программы.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -82,6 +86,10 @@ pub struct Settings {
     /// Подавлять ли фоновый шум при записи.
     #[serde(default)]
     pub noise_reduction: bool,
+    /// Сохранять ли аудиофайл записи (output.wav) после распознавания.
+    /// `false` — запись расшифровывается «из памяти», файл не создаётся.
+    #[serde(default = "default_keep_audio")]
+    pub keep_audio: bool,
 }
 
 impl Default for Settings {
@@ -95,6 +103,7 @@ impl Default for Settings {
             auto_start: false,
             input_gain: default_input_gain(),
             noise_reduction: false,
+            keep_audio: default_keep_audio(),
         }
     }
 }
@@ -261,6 +270,8 @@ mod tests {
         assert_eq!(settings.language, "ru");
         assert_eq!(settings.model_path, None);
         assert!(!settings.auto_start);
+        assert!(!settings.noise_reduction);
+        assert!(settings.keep_audio);
     }
 
     /// Полный файл настроек читается и сохраняется без потерь.
@@ -275,6 +286,7 @@ mod tests {
             auto_start: true,
             input_gain: 1.5,
             noise_reduction: true,
+            keep_audio: false,
         };
         let json = to_json(&settings).expect("сериализация");
         let parsed = parse_settings(&json).expect("обратная сериализация");

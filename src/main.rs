@@ -26,6 +26,52 @@ const LOG_FILE: &str = "voiceai.log";
 /// окружения WHISPER_MODEL (путь из настроек имеет приоритет).
 const MODEL_FILE: &str = "ggml-large-v3-turbo.bin";
 
+/// Что делать с аргументами командной строки (Y-11, Y-12).
+enum CliAction {
+    /// Обычный запуск: графическое окно.
+    Run,
+    /// Вывести версию и выйти с кодом 0.
+    PrintVersion,
+    /// Вывести справку и выйти с кодом 0.
+    PrintHelp,
+}
+
+/// Разбирает аргументы командной строки. Первый же «флаг действия»
+/// переопределяет запуск GUI: версия/справка важнее прочих аргументов.
+fn parse_cli(args: &[String]) -> CliAction {
+    for arg in args {
+        match arg.as_str() {
+            "-V" | "--version" => return CliAction::PrintVersion,
+            "-h" | "--help" => return CliAction::PrintHelp,
+            _ => {}
+        }
+    }
+    CliAction::Run
+}
+
+/// Печатает версию программы (значение из Cargo.toml).
+fn print_version() {
+    println!("VoiceAI {}", env!("CARGO_PKG_VERSION"));
+}
+
+/// Печатает справку по флагам.
+fn print_help() {
+    println!(
+        "VoiceAI {} — диктофон с локальным распознаванием речи (Whisper).",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!();
+    println!("Использование: VoiceAI [ФЛАГИ]");
+    println!();
+    println!("Флаги:");
+    println!("  -h, --help      показать эту справку");
+    println!("  -V, --version   показать версию программы");
+    println!();
+    println!(
+        "Без флагов открывается графическое окно. Зажмите F1, говорите, отпустите — текст появится под курсором."
+    );
+}
+
 /// Число параллельных потоков для Whisper. Основные вычисления уходят на
 /// видеокарту (CUDA), а CPU-часть (токенизация, часть декодов) разгоняем
 /// до 8 потоков — этого с запасом хватает, не перегружая систему.
@@ -284,6 +330,15 @@ impl eframe::App for DictophoneApp {
                     );
 
                     ui.add_space(10.0);
+                    // Хранение аудиофайла записи (AG-10).
+                    ui.checkbox(
+                        &mut new_settings.keep_audio,
+                        "Сохранять аудио записи (output.wav)",
+                    );
+                    ui.add_space(2.0);
+                    ui.label("Выключите, чтобы не оставлять файлы записей — расшифровка всё равно работает");
+
+                    ui.add_space(10.0);
                     ui.label("Режим нажатия клавиши:");
                     ui.radio_value(
                         &mut new_settings.press_mode,
@@ -445,7 +500,9 @@ enum KeyCommand {
 /// Задание на транскрибацию: готовый WAV-файл и его сэмплы.
 enum TranscriptionJob {
     Text {
-        /// Путь к сохранённому WAV (рядом с ним создастся .txt).
+        /// Путь к сохранённому WAV (рядом с ним создастся .txt). Если
+        /// `keep_audio == false`, самого файла может не быть — текст просто
+        /// ложится рядом по этому пути.
         wav_path: String,
         /// Накопленные моно-сэмплы записи (родная частота микрофона).
         samples: Vec<i16>,
@@ -455,6 +512,8 @@ enum TranscriptionJob {
         auto_punctuation: bool,
         /// Применять ли подавление фонового шума при подготовке аудио.
         noise_reduction: bool,
+        /// Сохранён ли аудиофайл записи (false — расшифровка «из памяти»).
+        keep_audio: bool,
     },
 }
 
@@ -511,6 +570,20 @@ fn raw_display(raw: &str) -> &str {
 }
 
 fn main() -> eframe::Result {
+    // Командная строка (Y-11, Y-12): --version / --help работают без GUI.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_cli(&args) {
+        CliAction::PrintVersion => {
+            print_version();
+            std::process::exit(0);
+        }
+        CliAction::PrintHelp => {
+            print_help();
+            std::process::exit(0);
+        }
+        CliAction::Run => {}
+    }
+
     // Одна копия приложения (B-13): вторая копия не должна мешать первой.
     let _guard = match single_instance::SingleInstanceGuard::acquire() {
         Ok(guard) => guard,
@@ -828,23 +901,44 @@ fn run_recorder(state: Arc<Mutex<AppState>>, key_rx: Receiver<KeyCommand>) {
                 set_recording(&state, false);
                 smoothed_level = 0.0;
                 set_level(&state, 0.0);
-                match save_wav(&buffer, capture.sample_rate, OUTPUT_FILE) {
-                    Ok(path) => {
-                        append_log(
-                            &state,
-                            format!("Файл сохранён: {path}. Начинаю расшифровку..."),
-                        );
-                        // Отправляем запись на транскрибацию с текущими настройками
-                        // пунктуации и шумоподавления.
-                        let _ = transcribe_tx.send(TranscriptionJob::Text {
-                            wav_path: path,
-                            samples: buffer.clone(),
-                            sample_rate: capture.sample_rate,
-                            auto_punctuation: settings.auto_punctuation,
-                            noise_reduction: settings.noise_reduction,
-                        });
+                // Отправляем запись на транскрибацию с текущими настройками
+                // пунктуации, шумоподавления и сохранения аудио.
+                let keep_audio = settings.keep_audio;
+                if keep_audio {
+                    match save_wav(&buffer, capture.sample_rate, OUTPUT_FILE) {
+                        Ok(path) => {
+                            append_log(
+                                &state,
+                                format!("Файл сохранён: {path}. Начинаю расшифровку..."),
+                            );
+                            let _ = transcribe_tx.send(TranscriptionJob::Text {
+                                wav_path: path.to_string(),
+                                samples: buffer.clone(),
+                                sample_rate: capture.sample_rate,
+                                auto_punctuation: settings.auto_punctuation,
+                                noise_reduction: settings.noise_reduction,
+                                keep_audio,
+                            });
+                        }
+                        Err(err) => append_log(&state, format!("Ошибка сохранения: {err}")),
                     }
-                    Err(err) => append_log(&state, format!("Ошибка сохранения: {err}")),
+                } else {
+                    // Хранение аудио отключено (AG-10): файл не создаём,
+                    // расшифровываем запись прямо из памяти.
+                    append_log(
+                        &state,
+                        "Запись не сохранена в файл: хранение аудио отключено \
+                                 (настройка «Хранить аудио»). Начинаю расшифровку..."
+                            .to_string(),
+                    );
+                    let _ = transcribe_tx.send(TranscriptionJob::Text {
+                        wav_path: OUTPUT_FILE.to_string(),
+                        samples: buffer.clone(),
+                        sample_rate: capture.sample_rate,
+                        auto_punctuation: settings.auto_punctuation,
+                        noise_reduction: settings.noise_reduction,
+                        keep_audio,
+                    });
                 }
             }
         } else {
@@ -884,6 +978,7 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
                 sample_rate,
                 auto_punctuation,
                 noise_reduction,
+                keep_audio,
             } = job;
 
             // Оборачиваем работу в catch_unwind: поток не должен умирать.
@@ -913,15 +1008,21 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
                             ),
                         );
                     } else {
+                        let saved_mark = if keep_audio {
+                            String::new()
+                        } else {
+                            " Аудиофайл не сохранён (настройка «Хранить аудио»).".to_string()
+                        };
                         append_log(
                             &state,
                             format!(
-                                "Расшифровка готова: {} (слов: {}). Запись: {} (длина {:.2} с, уровень {:.3}).\n  Сырой текст Whisper: {}\n  После обработки: {}",
+                                "Расшифровка готова: {} (слов: {}). Запись: {} (длина {:.2} с, уровень {:.3}).{}\n  Сырой текст Whisper: {}\n  После обработки: {}",
                                 outcome.txt_path,
                                 outcome.word_count,
                                 wav_path,
                                 outcome.audio_secs,
                                 outcome.signal_level,
+                                saved_mark,
                                 raw_display(&outcome.raw_text),
                                 outcome.text,
                             ),
@@ -934,12 +1035,32 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
                             match insert::insert_text_at_cursor(&outcome.text) {
                                 Ok(_) => append_log(
                                     &state,
-                                    "Текст вставлен в активное окно (под курсор).".to_string(),
+                                    "Текст вставлен в активное окно (под курсор). \
+                                     Метод вставки: SendInput с KEYEVENTF_UNICODE, \
+                                     буфер обмена не используется (K-25)."
+                                        .to_string(),
                                 ),
-                                Err(err) => append_log(
-                                    &state,
-                                    format!("Не удалось вставить текст в окно: {err}"),
-                                ),
+                                Err(err) => {
+                                    // O-15: вставка не удалась — текст не пропадает,
+                                    // уходит в буфер обмена как запасной путь.
+                                    match insert::copy_to_clipboard(&outcome.text) {
+                                        Ok(()) => append_log(
+                                            &state,
+                                            format!(
+                                                "Не удалось вставить текст в активное окно ({err}). \
+                                                 Текст скопирован в буфер обмена — вставьте его сами (Ctrl+V)."
+                                            ),
+                                        ),
+                                        Err(clip_err) => append_log(
+                                            &state,
+                                            format!(
+                                                "Не удалось вставить текст в окно ({err}) и скопировать \
+                                                 в буфер обмена ({clip_err}). Текст сохранён: {}.",
+                                                outcome.txt_path
+                                            ),
+                                        ),
+                                    }
+                                }
                             }
                         }
                     }
@@ -1481,4 +1602,46 @@ fn save_wav(
     writer.finalize()?;
 
     Ok(path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_runs_gui_without_flags() {
+        assert!(matches!(parse_cli(&[]), CliAction::Run));
+        assert!(matches!(parse_cli(&["some.wav".into()]), CliAction::Run));
+        assert!(matches!(
+            parse_cli(&["--model".into(), "m.bin".into()]),
+            CliAction::Run
+        ));
+    }
+
+    #[test]
+    fn cli_version_flag_wins_over_help_order() {
+        // Первый же «флаг действия» решает: версия важнее справки.
+        assert!(matches!(
+            parse_cli(&["--version".into()]),
+            CliAction::PrintVersion
+        ));
+        assert!(matches!(parse_cli(&["-V".into()]), CliAction::PrintVersion));
+        assert!(matches!(
+            parse_cli(&["-h".into(), "--version".into()]),
+            CliAction::PrintHelp
+        ));
+        assert!(matches!(
+            parse_cli(&["--version".into(), "-h".into()]),
+            CliAction::PrintVersion
+        ));
+    }
+
+    #[test]
+    fn cli_help_flag() {
+        assert!(matches!(
+            parse_cli(&["--help".into()]),
+            CliAction::PrintHelp
+        ));
+        assert!(matches!(parse_cli(&["-h".into()]), CliAction::PrintHelp));
+    }
 }

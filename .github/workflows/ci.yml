@@ -2,102 +2,65 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Версия из rust-toolchain.toml; для явности дублируем в шагах.
+  TOOLCHAIN: "1.95.0"
 
 jobs:
-  check-windows:
-    name: fmt + clippy + test (Windows)
-    runs-on: windows-latest
+  # Форматирование — проверяется на всех трёх ОС (без сборки, дёшево).
+  fmt:
+    name: fmt (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: clippy, rustfmt
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Format check
+      - name: Установить тулчейн (${{ env.TOOLCHAIN }})
+        run: |
+          rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --component rustfmt
+          rustup default ${{ env.TOOLCHAIN }}
+      - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Tests
-        run: cargo test
-
-  check-linux:
-    name: build + test (Ubuntu 24.04)
-    runs-on: ubuntu-24.04
+  # Статический анализ и тесты (кроме Windows: там whisper-rs собирается
+  # с CUDA и требует локальный CUDA Toolkit — см. build.bat).
+  lint-and-test:
+    name: lint+test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Системные библиотеки (Ubuntu)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake
+          sudo apt-get install -y build-essential cmake clang libclang-dev pkg-config \
+            libasound2-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libwayland-dev libssl-dev
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: clippy, rustfmt
+      - name: Установить тулчейн (${{ env.TOOLCHAIN }})
+        run: |
+          rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --component rustfmt,clippy
+          rustup default ${{ env.TOOLCHAIN }}
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Format check
+      - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      - name: cargo clippy -- -D warnings
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Tests
-        run: cargo test
-
-  check-macos:
-    name: build + test (macOS 15)
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: clippy, rustfmt
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Format check
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Tests
-        run: cargo test
+      - name: cargo test
+        run: cargo test --all-targets
