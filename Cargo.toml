@@ -25,6 +25,13 @@ eframe = { version = "0.36", default-features = false, features = ["glow", "defa
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# chrono — работа с датой/временем для логирования статистики
+chrono = { version = "0.4", features = ["serde"] }
+# uuid — генерация уникальных идентификаторов для логов
+uuid = { version = "1", features = ["v4", "serde"] }
+# csv — экспорт статистики в CSV
+csv = "1"
+
 # arboard — работа с системным буфером обмена (копирование текста).
 arboard = "3"
 

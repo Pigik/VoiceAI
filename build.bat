@@ -55,4 +55,7 @@ if exist "%~dp0ggml-large-v3-turbo.bin" copy /y "%~dp0ggml-large-v3-turbo.bin" "
 
 echo.
 echo Готово. Запускайте %OUT%\VoiceAI.exe
+
+
 exit /b 0
+

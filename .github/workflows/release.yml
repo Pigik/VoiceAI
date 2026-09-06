@@ -1,0 +1,96 @@
+name: Релиз (Windows)
+
+# Собирает готовый, самодостаточный архив с VoiceAI.exe, моделью Whisper
+# и библиотеками CUDA и крепит его к GitHub Release (по тегу v*).
+# Пользователям со слабыми компьютерами компилировать ничего не нужно:
+# они просто скачивают готовый zip с вкладки Releases.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Проверка исходников
+        uses: actions/checkout@v4
+
+      - name: Настройка Rust (1.95 из rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Кеш зависимостей
+        uses: Swatinem/rust-cache@v2
+
+      # build.bat ищет vcvars64.bat только для редакции Community, а на
+      # GitHub-раннере стоит Enterprise — настраиваем MSVC универсально.
+      - name: Окружение MSVC (cl.exe)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # bindgen (генерация привязок whisper-rs) требует libclang.dll.
+      # На раннере LLVM установлен, но переменная LIBCLANG_PATH не задана.
+      - name: Поиск LLVM (libclang для bindgen)
+        shell: pwsh
+        run: |
+          $paths = @(
+            'C:\Program Files\LLVM\bin',
+            "$env:ProgramFiles\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin",
+            "$env:ProgramFiles\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\bin"
+          ) | Where-Object { Test-Path "$_\libclang.dll" }
+          if ($paths) {
+            "LIBCLANG_PATH=$($paths[0])" | Out-File -FilePath $env:GITHUB_ENV -Append
+            Write-Output "libclang найден: $($paths[0])"
+          } else {
+            throw "libclang.dll не найден — нужен LLVM для bindgen"
+          }
+
+      - name: Поиск CUDA Toolkit
+        shell: pwsh
+        run: |
+          $cuda = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory |
+                  Where-Object { $_.Name.StartsWith('v') } |
+                  Sort-Object { [version]$_.Name.Substring(1) } -Descending |
+                  Select-Object -First 1
+          if (-not $cuda) {
+            throw "CUDA Toolkit не найден на раннере"
+          }
+          "CUDA_PATH=$($cuda.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($cuda.FullName)\bin;$($cuda.FullName)\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append
+          Write-Output "Используется CUDA: $($cuda.FullName)"
+
+      - name: Скачивание модели Whisper
+        run: .\download_models.bat
+
+      # build.rs сам кладёт модель и DLL CUDA рядом с exe в target\release.
+      - name: Сборка релиза (CUDA)
+        run: cargo build --release
+
+      - name: Упаковка в автономный zip
+        run: .\package.bat
+
+      - name: Проверка архива
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\VoiceAI-windows-x64.zip")) {
+            throw "Архив dist\VoiceAI-windows-x64.zip не создан"
+          }
+
+      - name: Сохранение артефакта (для ручного запуска без тега)
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceAI-windows-x64
+          path: dist/VoiceAI-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Публикация в GitHub Release (по тегу v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/VoiceAI-windows-x64.zip
+          draft: true

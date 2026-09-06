@@ -90,6 +90,9 @@ pub struct Settings {
     /// `false` — запись расшифровывается «из памяти», файл не создаётся.
     #[serde(default = "default_keep_audio")]
     pub keep_audio: bool,
+
+    #[serde(default)]
+    pub privacy_mode: bool,
 }
 
 impl Default for Settings {
@@ -104,6 +107,7 @@ impl Default for Settings {
             input_gain: default_input_gain(),
             noise_reduction: false,
             keep_audio: default_keep_audio(),
+            privacy_mode: false,
         }
     }
 }
@@ -287,6 +291,7 @@ mod tests {
             input_gain: 1.5,
             noise_reduction: true,
             keep_audio: false,
+            privacy_mode: true,
         };
         let json = to_json(&settings).expect("сериализация");
         let parsed = parse_settings(&json).expect("обратная сериализация");

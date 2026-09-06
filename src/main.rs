@@ -1,7 +1,10 @@
 // На Windows скрываем консольное окно: приложение запускается только как GUI.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use voiceai::{audio, autostart, insert, postprocess, settings, single_instance};
+use voiceai::stats_logger::{ReplicaLog, log_replica};
+use voiceai::{
+    analytics, audio, autostart, insert, postprocess, settings, single_instance, stats_logger,
+};
 
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -21,6 +24,8 @@ const OUTPUT_FILE: &str = "output.wav";
 /// работы: сохранение, расшифровка, ошибки. Помогает понять, что пошло не так,
 /// когда окно программы не показывает деталей.
 const LOG_FILE: &str = "voiceai.log";
+/// Максимальное число записей, хранимых в памяти для журнала реплик.
+const MAX_IN_MEMORY_REPLICAS: usize = 200;
 /// Имя файла модели Whisper (GGML .bin). Модель будет искаться рядом
 /// с программой, в текущей папке, в папке models/ или по переменной
 /// окружения WHISPER_MODEL (путь из настроек имеет приоритет).
@@ -94,6 +99,8 @@ struct AppState {
     devices: Vec<String>,
     /// Текущий уровень входного сигнала в диапазоне 0..=1 (для индикатора).
     input_level: f32,
+    /// Журнал реплик (записей) за текущую сессию — для окна «Журнал».
+    replicas: Vec<ReplicaLog>,
 }
 
 /// GUI-приложение: белое окно с текстом по центру и окном настроек.
@@ -101,6 +108,10 @@ struct DictophoneApp {
     state: Arc<Mutex<AppState>>,
     /// Открыто ли окно настроек.
     show_settings: bool,
+    /// Открыто ли окно журнала реплик.
+    show_journal: bool,
+    /// Индекс выбранной записи в журнале (для просмотра полного текста).
+    selected_replica: Option<usize>,
     /// Куда экспортировать профиль настроек (путь в поле ввода).
     export_path: String,
     /// Откуда импортировать профиль настроек (путь в поле ввода).
@@ -120,6 +131,8 @@ impl DictophoneApp {
         Self {
             state,
             show_settings: open_settings,
+            show_journal: false,
+            selected_replica: None,
             export_path: default_profile_path(),
             import_path: String::new(),
             #[cfg(target_os = "windows")]
@@ -148,13 +161,15 @@ impl eframe::App for DictophoneApp {
         // Обновляем окно даже когда ничего не меняется, чтобы показывать статус.
         ui.ctx().request_repaint_after(Duration::from_millis(50));
 
-        let (recording, status, settings, devices, input_level) = match self.state.lock() {
+        let (recording, status, settings, devices, input_level, replicas) = match self.state.lock()
+        {
             Ok(state) => (
                 state.recording,
                 state.status.clone(),
                 state.settings.clone(),
                 state.devices.clone(),
                 state.input_level,
+                state.replicas.clone(),
             ),
             // Мьютекс отравлен паникой другого потока — показываем ошибку.
             Err(_) => {
@@ -204,9 +219,14 @@ impl eframe::App for DictophoneApp {
             )
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    if ui.button("⚙ Настройки").clicked() {
-                        self.show_settings = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("⚙ Настройки").clicked() {
+                            self.show_settings = true;
+                        }
+                        if ui.button("📋 Журнал").clicked() {
+                            self.show_journal = true;
+                        }
+                    });
                 });
             });
 
@@ -328,6 +348,15 @@ impl eframe::App for DictophoneApp {
                         &mut new_settings.noise_reduction,
                         "Подавление фонового шума",
                     );
+
+                    ui.add_space(10.0);
+                    // Режим приватности: текст реплик не сохраняется в журнале.
+                    ui.checkbox(
+                        &mut new_settings.privacy_mode,
+                        "Режим приватности (не сохранять текст реплик)",
+                    );
+                    ui.add_space(2.0);
+                    ui.label("Статистика и число слов записываются, а сам текст расшифровки в журнале скрывается");
 
                     ui.add_space(10.0);
                     // Хранение аудиофайла записи (AG-10).
@@ -486,6 +515,117 @@ impl eframe::App for DictophoneApp {
                 }
             }
         }
+
+        // Окно журнала реплик: список всех вставок/записей текущей сессии.
+        if self.show_journal {
+            let mut open = true;
+            egui::Window::new("Журнал реплик")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .min_width(460.0)
+                .default_size([560.0, 480.0])
+                .show(ui.ctx(), |ui| {
+                    if replicas.is_empty() {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Записей ещё нет. Зажмите F1 и поговорите, чтобы они появились здесь.");
+                        });
+                        return;
+                    }
+
+                    // Сводка за сегодня (аналитика).
+                    let daily = analytics::calculate_daily_stats(&replicas);
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Записей сегодня: {}", daily.total_replicas));
+                        ui.separator();
+                        ui.label(format!("Слов: {}", daily.total_words));
+                        ui.separator();
+                        ui.label(format!(
+                            "Средняя длительность: {:.0} мс",
+                            daily.avg_latency_ms
+                        ));
+                    });
+                    ui.add_space(6.0);
+                    ui.separator();
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            // Отображаем новые записи сверху.
+                            for (idx, replica) in replicas.iter().rev().enumerate() {
+                                let global_idx = replicas.len() - 1 - idx;
+                                let when = replica.timestamp.format("%d.%m %H:%M");
+                                let words = replica.word_count;
+                                let app = if replica.app_name.trim().is_empty() {
+                                    " (неизвестное окно)".to_string()
+                                } else {
+                                    format!(" → {}", replica.app_name)
+                                };
+                                let preview = replica
+                                    .text
+                                    .as_deref()
+                                    .map(|t| {
+                                        let t = t.trim();
+                                        if t.len() > 60 {
+                                            format!("{}…", &t[..60])
+                                        } else {
+                                            t.to_string()
+                                        }
+                                    })
+                                    .unwrap_or_else(|| "(текст скрыт режимом приватности)".to_string());
+
+                                ui.horizontal(|ui| {
+                                    let head = format!("[{when}] {words} слов{app}");
+                                    if ui.selectable_label(
+                                        self.selected_replica == Some(global_idx),
+                                        head,
+                                    ).clicked() {
+                                        self.selected_replica = Some(global_idx);
+                                    }
+                                });
+                                if !preview.is_empty() {
+                                    ui.label(preview);
+                                }
+                                ui.separator();
+                            }
+                        });
+
+                    // Полный текст выбранной записи.
+                    if let Some(idx) = self.selected_replica
+                        && let Some(replica) = replicas.get(idx)
+                    {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.heading("Полный текст");
+                            if let Some(text) = &replica.text {
+                                if ui.button("📋 Копировать").clicked() {
+                                    ui.ctx().copy_text(text.clone());
+                                }
+                            }
+                        });
+                        if let Some(text) = &replica.text {
+                            egui::ScrollArea::vertical()
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut text.clone())
+                                            .desired_width(f32::INFINITY)
+                                            .interactive(false),
+                                    );
+                                });
+                        } else {
+                            ui.label("Текст скрыт (режим приватности).");
+                        }
+                    }
+                });
+
+            // Пользователь закрыл окно крестиком.
+            if !open {
+                self.show_journal = false;
+                self.selected_replica = None;
+            }
+        }
     }
 }
 
@@ -569,6 +709,79 @@ fn raw_display(raw: &str) -> &str {
     }
 }
 
+/// Путь к файлу журнала реплик (jsonl) в папке данных приложения.
+fn replica_log_path() -> Option<std::path::PathBuf> {
+    settings::config_dir().map(|dir| dir.join("replicas.jsonl"))
+}
+
+/// Сохраняет результат расшифровки в журнал реплик: в память (для окна
+/// «Журнал») и на диск (переживает перезапуск). Режим приватности
+/// убирает текст реплик.
+fn record_replica(state: &Arc<Mutex<AppState>>, outcome: &TranscribeOutcome, privacy_mode: bool) {
+    let mut replica = ReplicaLog {
+        id: uuid::Uuid::new_v4(),
+        timestamp: chrono::Local::now(),
+        app_name: active_window_title(),
+        duration_ms: (outcome.audio_secs * 1000.0) as u64,
+        word_count: outcome.word_count,
+        text: if outcome.word_count == 0 {
+            None
+        } else {
+            Some(outcome.text.clone())
+        },
+        wpm: if outcome.audio_secs > 0.0 {
+            outcome.word_count as f64 / (outcome.audio_secs / 60.0)
+        } else {
+            0.0
+        },
+    };
+    if privacy_mode {
+        replica.text = None;
+    }
+
+    // В память — для мгновенного показа в окне «Журнал».
+    if let Ok(mut s) = state.lock() {
+        s.replicas.push(replica.clone());
+        if s.replicas.len() > MAX_IN_MEMORY_REPLICAS {
+            let drop_count = s.replicas.len() - MAX_IN_MEMORY_REPLICAS;
+            s.replicas.drain(0..drop_count);
+        }
+    }
+
+    // На диск — чтобы реплики пережили перезапуск приложения.
+    if let Some(path) = replica_log_path() {
+        log_replica(&path, replica, false);
+    }
+}
+
+/// Имя активного окна (куда будет вставлен текст). На Windows — заголовок
+/// foreground-окна; на других платформах пустая строка.
+#[cfg(target_os = "windows")]
+fn active_window_title() -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
+    };
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return String::new();
+        }
+        let len = GetWindowTextLengthW(hwnd);
+        if len == 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let written = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        buf.truncate(written.max(0) as usize);
+        String::from_utf16_lossy(&buf)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn active_window_title() -> String {
+    String::new()
+}
+
 fn main() -> eframe::Result {
     // Командная строка (Y-11, Y-12): --version / --help работают без GUI.
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -630,12 +843,16 @@ fn main() -> eframe::Result {
         initial_status = format!("Автозапуск: {err}");
     }
 
-    let app_state = AppState {
+    let mut app_state = AppState {
         devices,
         settings,
         status: initial_status,
         ..Default::default()
     };
+    // Журнал реплик переживает перезапуск: подгружаем сохранённые записи.
+    if let Some(path) = replica_log_path() {
+        app_state.replicas = stats_logger::read_replicas(&path);
+    }
     let state = Arc::new(Mutex::new(app_state));
 
     // Канал команд от горячей клавиши к диктофону.
@@ -999,6 +1216,9 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
 
             match result {
                 Ok(Ok(outcome)) => {
+                    // Сохраняем реплику в журнал (память + диск) до вставки,
+                    // чтобы запись не потерялась, даже если вставка не удастся.
+                    record_replica(&state, &outcome, settings.privacy_mode);
                     if outcome.word_count == 0 {
                         append_log(
                             &state,
