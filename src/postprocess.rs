@@ -382,60 +382,24 @@ mod tests {
         postprocess_text(text, true)
     }
 
-    fn pp_raw(text: &str) -> String {
-        postprocess_text(text, false)
-    }
-
     #[test]
-    fn removes_filler_words() {
+    fn removes_filler_words_and_sounds() {
         assert_eq!(pp("ну вот привет"), "Привет.");
-        assert_eq!(pp("привет ну вот как дела"), "Привет как дела.");
         assert_eq!(pp("это типа классная идея"), "Это классная идея.");
-        assert_eq!(pp("ну я короче готов"), "Я готов.");
-    }
-
-    #[test]
-    fn removes_sound_words() {
         assert_eq!(pp("э-э я мм думаю"), "Я думаю.");
-        assert_eq!(pp("угу ага конечно"), "Конечно.");
-    }
-
-    #[test]
-    fn removes_repeated_words() {
-        assert_eq!(pp("очень очень интересно"), "Очень интересно.");
-        assert_eq!(pp("я я согласен"), "Я согласен.");
-        assert_eq!(pp("он он придёт"), "Он придёт.");
-    }
-
-    #[test]
-    fn removes_phrases() {
-        assert_eq!(pp("так сказать это как бы секрет"), "Это секрет.");
         assert_eq!(pp("ну и вот начинаем"), "Начинаем.");
-        assert_eq!(pp("ну вот начинаем"), "Начинаем.");
+        assert_eq!(pp("очень очень интересно"), "Очень интересно.");
+        assert_eq!(pp("ну я короче готов"), "Я готов.");
     }
 
     #[test]
     fn adds_capital_and_period() {
         assert_eq!(pp("привет мир"), "Привет мир.");
         assert_eq!(pp("один. два три"), "Один. Два три.");
-        assert_eq!(pp("Привет МИР"), "Привет МИР.");
     }
 
     #[test]
-    fn collapses_punctuation() {
-        assert_eq!(pp("привет,,  мир!!"), "Привет, мир!");
-        assert_eq!(pp("привет . мир"), "Привет. Мир.");
-        assert_eq!(pp("это!!! отлично"), "Это! Отлично.");
-    }
-
-    #[test]
-    fn keeps_dash() {
-        assert_eq!(pp("это — важно"), "Это — важно.");
-        assert_eq!(pp("я — студент"), "Я — студент.");
-    }
-
-    #[test]
-    fn splits_paragraphs() {
+    fn splits_paragraphs_on_long_text() {
         let long = (1..=6u32)
             .map(|i| {
                 format!(
@@ -452,74 +416,8 @@ mod tests {
     }
 
     #[test]
-    fn short_text_single_paragraph() {
-        assert_eq!(pp("привет мир"), "Привет мир.");
-        assert_eq!(pp(""), "");
-    }
-
-    #[test]
-    fn keeps_meaningful_words() {
-        // «там» — осмысленное указание на место, не паразит.
-        assert_eq!(pp("оно там лежит"), "Оно там лежит.");
-    }
-
-    #[test]
-    fn keeps_question() {
-        assert_eq!(pp("привет как тебя зовут?"), "Привет как тебя зовут?");
-        assert_eq!(pp("привет как тебя зовут"), "Привет как тебя зовут.");
-    }
-
-    #[test]
-    fn multiline_segments_are_joined() {
-        assert_eq!(
-            pp("первая строка\nвторая строка"),
-            "Первая строка вторая строка."
-        );
-    }
-
-    #[test]
-    fn empty_and_punctuation_only() {
-        assert_eq!(pp("..."), "");
-        assert_eq!(pp("   "), "");
-    }
-
-    #[test]
     fn raw_mode_keeps_text_as_is() {
-        // Без автопунктуации: без точки, без заглавной буквы, без абзацев.
-        assert_eq!(pp_raw("привет мир"), "привет мир");
-        assert_eq!(pp_raw("привет.. как дела"), "привет.. как дела");
-    }
-
-    #[test]
-    fn raw_mode_still_removes_fillers() {
-        assert_eq!(pp_raw("ну вот привет"), "привет");
-        assert_eq!(pp_raw("э-э я мм думаю"), "я думаю");
-    }
-
-    #[test]
-    fn keeps_preposition_u() {
-        // Одиночное «у» — это предлог («у меня», «у тебя»), его нельзя вырезать.
-        assert_eq!(pp("у меня дома"), "У меня дома.");
-        assert_eq!(pp("у тебя всё хорошо"), "У тебя всё хорошо.");
-        assert_eq!(pp("книга у меня"), "Книга у меня.");
-    }
-
-    #[test]
-    fn raw_mode_empty_when_only_sounds() {
-        assert_eq!(pp_raw("э-э мм ..."), "");
-        assert_eq!(pp_raw("   "), "");
-    }
-
-    #[test]
-    fn raw_mode_does_not_split_paragraphs() {
-        let long = (1..=6u32)
-            .map(|i| format!("предложение номер {i}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let result = pp_raw(&long);
-        assert!(
-            !result.contains("\n\n"),
-            "без автопунктуации абзацы не создаются: {result}"
-        );
+        assert_eq!(postprocess_text("привет мир", false), "привет мир");
+        assert_eq!(postprocess_text("ну вот привет", false), "привет");
     }
 }

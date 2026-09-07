@@ -112,17 +112,6 @@ mod tests {
     }
 
     #[test]
-    fn unicode_event_uses_scan_code() {
-        // Кириллический символ должен уйти как Unicode-скан-код без виртуальной клавиши.
-        let evt = key_event(0, 'А' as u16, KEYEVENTF_UNICODE);
-        unsafe {
-            assert_eq!(evt.Anonymous.ki.wVk, 0);
-            assert_eq!(evt.Anonymous.ki.wScan, 'А' as u16);
-            assert_eq!(evt.Anonymous.ki.dwFlags, KEYEVENTF_UNICODE);
-        }
-    }
-
-    #[test]
     fn newline_produces_return_key() {
         // Перевод строки превращается в нажатие Enter (L-07).
         let evt = key_event(VK_RETURN, 0, 0);

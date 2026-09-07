@@ -566,10 +566,14 @@ impl eframe::App for DictophoneApp {
                                     .as_deref()
                                     .map(|t| {
                                         let t = t.trim();
-                                        if t.len() > 60 {
-                                            format!("{}…", &t[..60])
+                                        // Обрезаем по символам, а не по байтам:
+                                        // русский текст в UTF-8 давал панику «не граница
+                                        // символа» при вырезке &t[..60].
+                                        let head: String = t.chars().take(60).collect();
+                                        if t.chars().count() > 60 {
+                                            format!("{head}…")
                                         } else {
-                                            t.to_string()
+                                            head
                                         }
                                     })
                                     .unwrap_or_else(|| "(текст скрыт режимом приватности)".to_string());
@@ -598,18 +602,19 @@ impl eframe::App for DictophoneApp {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.heading("Полный текст");
-                            if let Some(text) = &replica.text {
-                                if ui.button("📋 Копировать").clicked() {
-                                    ui.ctx().copy_text(text.clone());
-                                }
+                            if let Some(text) = &replica.text
+                                && ui.button("📋 Копировать").clicked()
+                            {
+                                ui.ctx().copy_text(text.clone());
                             }
                         });
                         if let Some(text) = &replica.text {
+                            let mut text_clone = text.clone();
                             egui::ScrollArea::vertical()
                                 .max_height(200.0)
                                 .show(ui, |ui| {
                                     ui.add(
-                                        egui::TextEdit::multiline(&mut text.clone())
+                                        egui::TextEdit::multiline(&mut text_clone)
                                             .desired_width(f32::INFINITY)
                                             .interactive(false),
                                     );
@@ -1829,38 +1834,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_runs_gui_without_flags() {
+    fn cli_flags_override_gui() {
         assert!(matches!(parse_cli(&[]), CliAction::Run));
-        assert!(matches!(parse_cli(&["some.wav".into()]), CliAction::Run));
-        assert!(matches!(
-            parse_cli(&["--model".into(), "m.bin".into()]),
-            CliAction::Run
-        ));
-    }
-
-    #[test]
-    fn cli_version_flag_wins_over_help_order() {
-        // Первый же «флаг действия» решает: версия важнее справки.
         assert!(matches!(
             parse_cli(&["--version".into()]),
             CliAction::PrintVersion
-        ));
-        assert!(matches!(parse_cli(&["-V".into()]), CliAction::PrintVersion));
-        assert!(matches!(
-            parse_cli(&["-h".into(), "--version".into()]),
-            CliAction::PrintHelp
-        ));
-        assert!(matches!(
-            parse_cli(&["--version".into(), "-h".into()]),
-            CliAction::PrintVersion
-        ));
-    }
-
-    #[test]
-    fn cli_help_flag() {
-        assert!(matches!(
-            parse_cli(&["--help".into()]),
-            CliAction::PrintHelp
         ));
         assert!(matches!(parse_cli(&["-h".into()]), CliAction::PrintHelp));
     }

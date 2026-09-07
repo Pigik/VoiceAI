@@ -1,10 +1,10 @@
 /target
 /dist
 
-# Модели Whisper (~500 МБ) — скачиваются отдельно, в репозиторий не попадают.
+# Whisper models (~500 MB) are downloaded separately and never committed.
 *.bin
 
-# Запись и результаты распознавания создаются при запуске.
+# Recordings and recognition results are created at runtime.
 *.wav
 output.txt
 voiceai.log

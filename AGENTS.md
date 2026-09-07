@@ -61,6 +61,8 @@ cargo run --example transcribe_test -- test_russian.wav rу
 | `src/autostart.rs` | Автозапуск в Windows (реестр) | — |
 | `src/tray.rs` | Иконка в трее (Windows) | `create_tray`, `update_tray` |
 | `src/single_instance.rs` | Одна копия приложения (порт-лок) | `SingleInstanceGuard` |
+| `src/analytics.rs` | Дневная статистика (записи, слова, задержка) | `calculate_daily_stats`, `export_to_csv` |
+| `src/stats_logger.rs` | Журнал реплик в JSONL (ротация до 200) | `ReplicaLog`, `log_replica`/`read_replicas` |
 | `build.rs` | Копирует модель + CUDA DLL рядом с exe (Windows) | — |
 | `examples/transcribe_test.rs` | Проверка распознавания без GUI | — |
 
@@ -96,3 +98,11 @@ cargo run --example transcribe_test -- test_russian.wav rу
 - **`build.rs`** копирует `ggml-large-v3-turbo.bin` и CUDA DLL в `target/<profile>` — модель должна лежать в корне проекта.
 - **Тест `single_instance::tests::second_guard_rejected_until_first_released` падает, если приложение уже запущено** (занятый порт). Это не связано с изменениями в коде.
 - Сборка/линковка с `--features cuda` требует окружение MSVC (см. `build.bat`).
+- **`LNK1136: повреждённый argsort.obj` / сбой whisper-rs-sys при любом `cargo`-вызове**:
+  у CMake-сборки whisper.cpp c CUDA параллельность по умолчанию 32, и на
+  многоядерных машинах объектные файлы портятся. Перед любым `cargo check`/`test`/`build`
+  на Windows выставляй пониженную параллельность:
+  ```powershell
+  $env:CMAKE_BUILD_PARALLEL_LEVEL = "8"   # затем cargo check / test / build
+  ```
+  Это не связано с изменением кода — лечится пересборкой с меньшим `--parallel`.

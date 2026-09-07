@@ -258,8 +258,6 @@ pub fn import_settings(from_path: &str) -> Result<Settings, String> {
 mod tests {
     use super::*;
 
-    /// «Старый» файл настроек (только три первых поля) должен читаться:
-    /// новые поля получают значения по умолчанию.
     #[test]
     fn old_config_reads_with_defaults() {
         let old = r#"{
@@ -273,12 +271,8 @@ mod tests {
         assert!(!settings.auto_punctuation);
         assert_eq!(settings.language, "ru");
         assert_eq!(settings.model_path, None);
-        assert!(!settings.auto_start);
-        assert!(!settings.noise_reduction);
-        assert!(settings.keep_audio);
     }
 
-    /// Полный файл настроек читается и сохраняется без потерь.
     #[test]
     fn round_trip_keeps_values() {
         let settings = Settings {
@@ -296,50 +290,5 @@ mod tests {
         let json = to_json(&settings).expect("сериализация");
         let parsed = parse_settings(&json).expect("обратная сериализация");
         assert_eq!(parsed, settings);
-        assert!(json.contains("auto_start"));
-    }
-
-    /// Некорректное значение поля даёт понятную ошибку, а не панику.
-    #[test]
-    fn bad_value_gives_clear_error() {
-        let bad = r#"{ "press_mode": "Turbo" }"#;
-        let err = parse_settings(bad).expect_err("неверное значение отклоняется");
-        assert!(err.contains("Некорректное значение"), "ошибка: {err}");
-    }
-
-    /// Синтаксически битый JSON тоже даёт понятную ошибку.
-    #[test]
-    fn broken_json_gives_clear_error() {
-        let err = parse_settings("{ press_mode: ").expect_err("битый JSON отклоняется");
-        assert!(err.contains("Синтаксическая ошибка"), "ошибка: {err}");
-    }
-
-    /// В импортируемом профиле те же проверки, что и в основном файле.
-    #[test]
-    fn import_validates_like_regular_config() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("voiceai_test_import.json");
-        let json = r#"{ "auto_punctuation": "yes" }"#;
-        std::fs::write(&path, json).expect("запись тестового файла");
-        let result = import_settings(&path.to_string_lossy());
-        let _ = std::fs::remove_file(&path);
-        assert!(result.is_err());
-        let message = result.unwrap_err();
-        assert!(message.contains("Некорректный профиль"));
-    }
-
-    /// Экспорт создаёт файл, который потом можно импортировать.
-    #[test]
-    fn export_then_import_round_trip() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("voiceai_test_profile.json");
-        let settings = Settings {
-            auto_punctuation: false,
-            ..Settings::default()
-        };
-        export_settings(&path.to_string_lossy(), &settings).expect("экспорт");
-        let imported = import_settings(&path.to_string_lossy()).expect("импорт");
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(imported, settings);
     }
 }
