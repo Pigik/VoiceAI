@@ -65,17 +65,22 @@ jobs:
             throw "libclang.dll не найден — нужен LLVM для bindgen"
           }
 
-      # CUDA на GitHub-раннерах не предустановлена. Ставим только нужное whisper:
-      # nvcc + рантайм + cuBLAS. visual_studio_integration — чтобы CMake нашёл
-      # CUDA-тулсет в MSBuild (иначе «No CUDA toolset found»). Версия совпадает
-      # с .cargo/config.toml (CUDA_PATH_V13_3) и с локальной сборкой.
+      # CUDA на GitHub-раннерах не предустановлена. Ставим полный toolkit
+      # (sub-packages не задаём): имена покомпонентной установки на Windows
+      # недокументированы и меняются от версии к версии (cudart_dev/thrust
+      # там вообще невалидны), а полная установка детерминирована и включает
+      # VS-интеграцию, без которой CMake не находит CUDA-тулсет.
+      # use-github-cache/use-local-cache: false — кэш экшена глючил и давал
+      # ошибку установщика 3772776473 (0xE0E00019).
+      # Версия совпадает с .cargo/config.toml (CUDA_PATH_V13_3) и локальной сборкой.
       - name: Установка CUDA Toolkit 13.3
         uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
           cuda: '13.3.1'
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "cublas", "cublasLt", "visual_studio_integration"]'
+          use-github-cache: false
+          use-local-cache: false
 
       - name: Переменные CUDA для сборки
         shell: pwsh

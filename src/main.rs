@@ -112,8 +112,10 @@ struct AppState {
     download: DownloadState,
     /// Пользователь выбрал «Выход» (кнопка в окне или меню трея): следующее
     /// закрытие окна завершает приложение, а не прячет его в трей.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     want_exit: bool,
     /// Окно скрыто в фоновый режим (трей) — приложение продолжает работать.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     hidden: bool,
 }
 
