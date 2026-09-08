@@ -1,9 +1,11 @@
 // На Windows скрываем консольное окно: приложение запускается только как GUI.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[cfg(target_os = "windows")]
+use voiceai::insert;
 use voiceai::stats_logger::{ReplicaLog, log_replica};
 use voiceai::{
-    analytics, audio, autostart, download, insert, models, postprocess, settings, single_instance,
+    analytics, audio, autostart, download, models, postprocess, settings, single_instance,
     stats_logger,
 };
 
@@ -1315,6 +1317,8 @@ fn main() -> eframe::Result {
             // окно из фона/завершает приложение, даже когда окно скрыто.
             #[cfg(target_os = "windows")]
             spawn_tray_event_handler(cc.egui_ctx.clone(), state.clone());
+            #[cfg(not(target_os = "windows"))]
+            let _ = &cc;
             Ok(Box::new(DictophoneApp::new(
                 app_state_for_frame,
                 open_settings,

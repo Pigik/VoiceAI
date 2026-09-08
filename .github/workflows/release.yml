@@ -21,7 +21,9 @@ permissions:
 
 jobs:
   release-windows:
-    runs-on: windows-latest
+    # windows-latest уже обновлён до VS 2026, с которым CUDA 13.3 официально
+    # несовместима (нет VS-интеграции). Берём проверенную пару VS 2022 + CUDA 13.3.
+    runs-on: windows-2022
 
     steps:
       - name: Проверка исходников
@@ -63,19 +65,32 @@ jobs:
             throw "libclang.dll не найден — нужен LLVM для bindgen"
           }
 
-      - name: Поиск CUDA Toolkit
+      # CUDA на GitHub-раннерах не предустановлена. Ставим только нужное whisper:
+      # nvcc + рантайм + cuBLAS. visual_studio_integration — чтобы CMake нашёл
+      # CUDA-тулсет в MSBuild (иначе «No CUDA toolset found»). Версия совпадает
+      # с .cargo/config.toml (CUDA_PATH_V13_3) и с локальной сборкой.
+      - name: Установка CUDA Toolkit 13.3
+        uses: Jimver/cuda-toolkit@v0.2.36
+        id: cuda-toolkit
+        with:
+          cuda: '13.3.1'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublasLt", "visual_studio_integration"]'
+
+      - name: Переменные CUDA для сборки
         shell: pwsh
         run: |
-          $cuda = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory |
-                  Where-Object { $_.Name.StartsWith('v') } |
-                  Sort-Object { [version]$_.Name.Substring(1) } -Descending |
-                  Select-Object -First 1
-          if (-not $cuda) {
-            throw "CUDA Toolkit не найден на раннере"
+          $cudaPath = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          if (-not $cudaPath -or -not (Test-Path $cudaPath)) {
+            throw "CUDA не установлен: $cudaPath"
           }
-          "CUDA_PATH=$($cuda.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$($cuda.FullName)\bin;$($cuda.FullName)\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append
-          Write-Output "Используется CUDA: $($cuda.FullName)"
+          # Значения из окружения перекрывают жёсткие пути в .cargo/config.toml
+          # (там [env] заданы без force — существующие переменные не затираются).
+          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_HOME=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_PATH_V13_3=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          Write-Output "Используется CUDA: $cudaPath"
 
       # Качаем модель из нашего же GitHub Release: после первой публикации она
       # прикреплена отдельным asset'ом и живёт, пока жив репозиторий. HuggingFace
