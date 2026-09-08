@@ -3,7 +3,8 @@
 
 use voiceai::stats_logger::{ReplicaLog, log_replica};
 use voiceai::{
-    analytics, audio, autostart, insert, postprocess, settings, single_instance, stats_logger,
+    analytics, audio, autostart, download, insert, models, postprocess, settings, single_instance,
+    stats_logger,
 };
 
 use std::sync::mpsc::{self, Receiver};
@@ -16,7 +17,10 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use global_hotkey::hotkey::{Code, HotKey};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-use voiceai::settings::{PressMode, Settings};
+use transcribe_rs::onnx::Quantization;
+use transcribe_rs::onnx::gigaam::GigaAMModel;
+use transcribe_rs::{SpeechModel, TranscribeOptions};
+use voiceai::settings::{PressMode, Settings, SpeechEngine};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 const OUTPUT_FILE: &str = "output.wav";
@@ -73,7 +77,8 @@ fn print_help() {
     println!("  -V, --version   показать версию программы");
     println!();
     println!(
-        "Без флагов открывается графическое окно. Зажмите F1, говорите, отпустите — текст появится под курсором."
+        "Без флагов открывается графическое окно. Зажмите клавишу записи (по умолчанию F1), \
+         говорите, отпустите — текст появится под курсором."
     );
 }
 
@@ -101,6 +106,24 @@ struct AppState {
     input_level: f32,
     /// Журнал реплик (записей) за текущую сессию — для окна «Журнал».
     replicas: Vec<ReplicaLog>,
+    /// Состояние скачивания второй модели (GigaAM) для окна настроек.
+    download: DownloadState,
+    /// Пользователь выбрал «Выход» (кнопка в окне или меню трея): следующее
+    /// закрытие окна завершает приложение, а не прячет его в трей.
+    want_exit: bool,
+    /// Окно скрыто в фоновый режим (трей) — приложение продолжает работать.
+    hidden: bool,
+}
+
+/// Состояние скачивания модели GigaAM: идёт ли загрузка и её прогресс.
+#[derive(Clone, Default)]
+struct DownloadState {
+    /// Идёт ли скачивание прямо сейчас.
+    active: bool,
+    /// Сколько байт уже скачано.
+    downloaded: u64,
+    /// Сколько байт ожидается всего (0 — размер пока неизвестен).
+    total: u64,
 }
 
 /// GUI-приложение: белое окно с текстом по центру и окном настроек.
@@ -110,12 +133,19 @@ struct DictophoneApp {
     show_settings: bool,
     /// Открыто ли окно журнала реплик.
     show_journal: bool,
-    /// Индекс выбранной записи в журнале (для просмотра полного текста).
-    selected_replica: Option<usize>,
+    /// ID выбранной записи в журнале (для просмотра полного текста).
+    selected_replica: Option<uuid::Uuid>,
     /// Куда экспортировать профиль настроек (путь в поле ввода).
     export_path: String,
     /// Откуда импортировать профиль настроек (путь в поле ввода).
     import_path: String,
+    /// Идёт ли ожидание нажатия клавиши для переназначения горячей клавиши.
+    capture_hotkey: bool,
+    /// Менеджер глобальных горячих клавиш (обязан жить на главном потоке,
+    /// где работает цикл сообщений окна-приёмника системного хоткея).
+    _hotkey_manager: Option<GlobalHotKeyManager>,
+    /// Какая клавиша сейчас зарегистрирована (сверяется при каждом кадре).
+    current_hotkey: Option<HotKey>,
     /// Иконка в системном трее (Windows) и состояние, для которого она нарисована.
     #[cfg(target_os = "windows")]
     tray: Option<tray_icon::TrayIcon>,
@@ -127,7 +157,12 @@ struct DictophoneApp {
 
 impl DictophoneApp {
     /// `open_settings` — открыть окно настроек сразу (первый запуск или ошибка конфига).
-    fn new(state: Arc<Mutex<AppState>>, open_settings: bool) -> Self {
+    fn new(
+        state: Arc<Mutex<AppState>>,
+        open_settings: bool,
+        hotkey_manager: Option<GlobalHotKeyManager>,
+    ) -> Self {
+        let state_settings = state.lock().map(|s| s.settings.clone()).unwrap_or_default();
         Self {
             state,
             show_settings: open_settings,
@@ -135,6 +170,9 @@ impl DictophoneApp {
             selected_replica: None,
             export_path: default_profile_path(),
             import_path: String::new(),
+            capture_hotkey: false,
+            current_hotkey: Some(hotkey_from_settings(&state_settings)),
+            _hotkey_manager: hotkey_manager,
             #[cfg(target_os = "windows")]
             tray: None,
             #[cfg(target_os = "windows")]
@@ -161,15 +199,40 @@ impl eframe::App for DictophoneApp {
         // Обновляем окно даже когда ничего не меняется, чтобы показывать статус.
         ui.ctx().request_repaint_after(Duration::from_millis(50));
 
-        let (recording, status, settings, devices, input_level, replicas) = match self.state.lock()
-        {
+        // Закрытие окна крестиком (Windows) не завершает приложение, а прячет его
+        // в трей: запись и горячая клавиша продолжают работать. Полный выход — через кнопку
+        // «Выход» в правом верхнем углу или меню иконки в трее.
+        #[cfg(target_os = "windows")]
+        if ui.ctx().input(|i| i.viewport().close_requested()) {
+            let exit_chosen = self.state.lock().map(|s| s.want_exit).unwrap_or(false);
+            if !exit_chosen {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                let was_hidden = self.state.lock().map(|s| s.hidden).unwrap_or(false);
+                if let Ok(mut s) = self.state.lock() {
+                    s.hidden = true;
+                }
+                if !was_hidden {
+                    append_log(
+                        &self.state,
+                        "Окно скрыто в трей: приложение продолжает работать в фоне, \
+                         клавиша записи активна. Вернуть окно — иконка в трее, выйти — \
+                         меню трея или кнопка «Выход»."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        let (recording, status, settings, devices, input_level) = match self.state.lock() {
             Ok(state) => (
                 state.recording,
                 state.status.clone(),
                 state.settings.clone(),
                 state.devices.clone(),
                 state.input_level,
-                state.replicas.clone(),
             ),
             // Мьютекс отравлен паникой другого потока — показываем ошибку.
             Err(_) => {
@@ -182,6 +245,36 @@ impl eframe::App for DictophoneApp {
             }
         };
         let mut new_settings = settings.clone();
+
+        // Переназначаем горячую клавишу на лету: если в настройках сменилась
+        // (окно настроек или импорт профиля), снимаем старую и регистрируем новую.
+        // Менеджер живёт на главном потоке, поэтому и переназначение тут же.
+        if let Some(manager) = &self._hotkey_manager {
+            let desired = hotkey_from_settings(&new_settings);
+            if self.current_hotkey != Some(desired) {
+                if let Some(old) = self.current_hotkey {
+                    let _ = manager.unregister(old);
+                }
+                match manager.register(desired) {
+                    Ok(()) => {
+                        append_log(
+                            &self.state,
+                            format!("Горячая клавиша: {}", hotkey_label(&new_settings)),
+                        );
+                    }
+                    Err(err) => {
+                        set_status(
+                            &self.state,
+                            format!(
+                                "Не удалось зарегистрировать клавишу {}: {err}",
+                                hotkey_label(&new_settings)
+                            ),
+                        );
+                    }
+                }
+                self.current_hotkey = Some(desired);
+            }
+        }
 
         // Иконка в трее (Windows): создаём один раз на главном потоке и
         // перерисовываем под состояние записи, когда оно меняется.
@@ -208,6 +301,23 @@ impl eframe::App for DictophoneApp {
                 self.tray_recording = Some(recording);
             }
         }
+
+        // Кнопка «Выход» в правом верхнем углу главного окна (Windows): полное
+        // завершение приложения. В отличие от крестика, который скрывает окно
+        // в трей, она закрывает приложение с концами — оно исчезает из
+        // процессов и памяти.
+        #[cfg(target_os = "windows")]
+        egui::Area::new(egui::Id::new("voiceai_exit_button"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+            .show(ui.ctx(), |ui| {
+                if ui.button("Выход").clicked() {
+                    if let Ok(mut s) = self.state.lock() {
+                        s.want_exit = true;
+                    }
+                    append_log(&self.state, "Завершение работы приложения...".to_string());
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
 
         // Кнопка настроек — всегда внизу окна, в отдельной нижней панели,
         // чтобы она гарантированно не перекрывала и не «сдвигала» текст.
@@ -243,7 +353,7 @@ impl eframe::App for DictophoneApp {
                 let title = if recording {
                     "Идёт запись...".to_string()
                 } else {
-                    "Используйте F1 для записи".to_string()
+                    format!("Используйте {} для записи", hotkey_label(&settings))
                 };
                 let title_h = ui.text_style_height(&egui::TextStyle::Heading);
                 let meter_h = if recording {
@@ -296,6 +406,12 @@ impl eframe::App for DictophoneApp {
             });
 
         // Окно настроек поверх основного окна.
+        // Если окно закрыто (крестиком или сворачиванием), снимаем режим
+        // перехвата клавиши, чтобы при повторном открытии настройки не
+        // ждали нажатия.
+        if !self.show_settings {
+            self.capture_hotkey = false;
+        }
         if self.show_settings {
             egui::Window::new("Настройки")
                 .open(&mut self.show_settings)
@@ -368,6 +484,51 @@ impl eframe::App for DictophoneApp {
                     ui.label("Выключите, чтобы не оставлять файлы записей — расшифровка всё равно работает");
 
                     ui.add_space(10.0);
+                    // Клавиша вызова записи (переназначается нажатием).
+                    ui.label("Клавиша вызова записи:");
+                    let capture_label = if self.capture_hotkey {
+                        "Нажмите клавишу (F1–F12)…".to_string()
+                    } else {
+                        hotkey_label(&new_settings)
+                    };
+                    if ui
+                        .button(format!("{capture_label} — нажмите, чтобы сменить"))
+                        .clicked()
+                    {
+                        self.capture_hotkey = true;
+                    }
+                    if self.capture_hotkey {
+                        let events = ui.ctx().input(|i| i.events.clone());
+                        let cancel = events.iter().any(|event| {
+                            matches!(
+                                event,
+                                egui::Event::Key {
+                                    key: egui::Key::Escape,
+                                    pressed: true,
+                                    ..
+                                }
+                            )
+                        });
+                        let chosen = events.iter().find_map(|event| match event {
+                            egui::Event::Key {
+                                key, pressed: true, ..
+                            } => egui_key_to_hotkey_code(*key),
+                            _ => None,
+                        });
+                        if cancel {
+                            self.capture_hotkey = false;
+                        } else if let Some(code) = chosen {
+                            new_settings.hotkey = code.to_string();
+                            self.capture_hotkey = false;
+                        }
+                    }
+                    ui.add_space(2.0);
+                    ui.label(
+                        "Клавиша действует по всей системе. Для выбора подходят только \
+                         функциональные клавиши F1–F12 — буквы и цифры перехватывали бы ввод в других окнах",
+                    );
+
+                    ui.add_space(10.0);
                     ui.label("Режим нажатия клавиши:");
                     ui.radio_value(
                         &mut new_settings.press_mode,
@@ -402,24 +563,103 @@ impl eframe::App for DictophoneApp {
                     ui.label("«Автоопределение» — Whisper сам распознает язык");
 
                     ui.add_space(10.0);
-                    // Путь к модели Whisper (B-08), пусто — автопоиск.
-                    ui.label("Путь к модели Whisper (необязательно):");
-                    let mut model_path = new_settings.model_path.clone().unwrap_or_default();
-                    let mut model_path_changed = ui.text_edit_singleline(&mut model_path).changed();
-                    ui.horizontal(|ui| {
-                        if ui.button("Сбросить путь").clicked() {
-                            model_path.clear();
-                            model_path_changed = true;
+                    ui.separator();
+                    // Модель распознавания: Whisper (входит в поставку) или GigaAM
+                    // (пользователь скачивает её сам — см. src/models.rs).
+                    ui.label("Модель распознавания:");
+                    ui.radio_value(
+                        &mut new_settings.speech_engine,
+                        SpeechEngine::Whisper,
+                        "Whisper large-v3-turbo (входит в поставку)",
+                    );
+                    ui.radio_value(
+                        &mut new_settings.speech_engine,
+                        SpeechEngine::GigaAM,
+                        "GigaAM v3 e2e-ctc (скачивается отдельно)",
+                    );
+                    ui.add_space(4.0);
+
+                    if new_settings.speech_engine == SpeechEngine::Whisper {
+                        // Путь к модели Whisper (B-08), пусто — автопоиск.
+                        ui.label("Путь к модели Whisper (необязательно):");
+                        let mut model_path = new_settings.model_path.clone().unwrap_or_default();
+                        let mut model_path_changed =
+                            ui.text_edit_singleline(&mut model_path).changed();
+                        ui.horizontal(|ui| {
+                            if ui.button("Сбросить путь").clicked() {
+                                model_path.clear();
+                                model_path_changed = true;
+                            }
+                            ui.label(
+                                "Пусто — автоматический поиск (WHISPER_MODEL, папка программы, models/)",
+                            );
+                        });
+                        if model_path_changed {
+                            let trimmed = model_path.trim().to_string();
+                            new_settings.model_path = if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed)
+                            };
                         }
-                        ui.label("Пусто — автоматический поиск (WHISPER_MODEL, папка программы, models/)");
-                    });
-                    if model_path_changed {
-                        let trimmed = model_path.trim().to_string();
-                        new_settings.model_path = if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some(trimmed)
-                        };
+                    } else {
+                        // GigaAM: показывает, установлена ли модель, и позволяет скачать её.
+                        let gigaam_ready = models::resolve_gigaam_dir();
+                        let download = self
+                            .state
+                            .lock()
+                            .map(|s| s.download.clone())
+                            .unwrap_or_default();
+                        match (gigaam_ready, download.active) {
+                            (Some(dir), _) => {
+                                ui.label(format!("Модель установлена: {}", dir.display()));
+                                ui.add_space(2.0);
+                                ui.label(
+                                    "Расшифровка пойдёт через GigaAM: русская речь с пунктуацией, работает на CPU",
+                                );
+                            }
+                            (None, true) => {
+                                let percent = if download.total > 0 {
+                                    (download.downloaded as f32 / download.total as f32 * 100.0)
+                                        .clamp(0.0, 100.0)
+                                } else {
+                                    0.0
+                                };
+                                let progress_text = if download.total > 0 {
+                                    format!(
+                                        "Скачивание: {percent:.0}% ({} МБ)",
+                                        download.downloaded / (1024 * 1024)
+                                    )
+                                } else {
+                                    format!(
+                                        "Скачивание: {} МБ...",
+                                        download.downloaded / (1024 * 1024)
+                                    )
+                                };
+                                ui.add(
+                                    egui::ProgressBar::new(percent / 100.0)
+                                        .desired_width(280.0)
+                                        .text(progress_text),
+                                );
+                                ui.add_space(2.0);
+                                ui.label(
+                                    "Модель загружается один раз. По завершении распознавание пойдёт через GigaAM",
+                                );
+                            }
+                            (None, false) => {
+                                if ui
+                                    .button("Скачать модель GigaAM v3 (~215 МБ, int8)")
+                                    .clicked()
+                                {
+                                    start_gigaam_download(self.state.clone());
+                                }
+                                ui.add_space(2.0);
+                                ui.label(
+                                    "Скачается один раз в папку данных приложения. Модель понимает \
+                                     русскую речь и сама расставляет пунктуацию",
+                                );
+                            }
+                        }
                     }
 
                     ui.add_space(10.0);
@@ -506,8 +746,18 @@ impl eframe::App for DictophoneApp {
                         Err(err) => append_log(&self.state, format!("Автозапуск: {err}")),
                     }
                 }
-                if let Ok(mut state) = self.state.lock() {
-                    state.settings = new_settings.clone();
+                match self.state.lock() {
+                    Ok(mut state) => {
+                        state.settings = new_settings.clone();
+                    }
+                    Err(_) => {
+                        append_log(
+                            &self.state,
+                            "Настройки применены, но не удалось записать в память \
+                             (мьютекс отравлен). Перезапустите приложение."
+                                .to_string(),
+                        );
+                    }
                 }
                 match settings::save_settings(&new_settings) {
                     Ok(()) => {}
@@ -517,18 +767,68 @@ impl eframe::App for DictophoneApp {
         }
 
         // Окно журнала реплик: список всех вставок/записей текущей сессии.
+        // Клонируем журнал только когда окно открыто — экономим память и CPU.
         if self.show_journal {
+            let replicas = self
+                .state
+                .lock()
+                .map(|s| s.replicas.clone())
+                .unwrap_or_default();
             let mut open = true;
+            // Пользователь нажал свою кнопку «закрыть» в собственной шапке окна.
+            let mut close_requested = false;
+            // Действия, выбранные кнопками в этом кадре; применяем после отрисовки,
+            // чтобы не менять список во время итерации.
+            let mut clear_all = false;
+            let mut delete_id: Option<uuid::Uuid> = None;
+
             egui::Window::new("Журнал реплик")
+                .id(egui::Id::new("journal_window"))
                 .open(&mut open)
                 .collapsible(false)
+                // Собственная «шапка» вместо дефолтной: в ней нет лишних кнопок/квадратов
+                // и можно поставить нужные действия (очистить журнал, закрыть).
+                .title_bar(false)
                 .resizable(true)
-                .min_width(460.0)
-                .default_size([560.0, 480.0])
+                .min_width(500.0)
+                .default_size([620.0, 560.0])
                 .show(ui.ctx(), |ui| {
+                    // --- Шапка окна: заголовок слева, кнопки действий справа. ---
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Журнал реплик")
+                                .strong()
+                                .size(17.0),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button("✖")
+                                .on_hover_text("Закрыть журнал")
+                                .clicked()
+                            {
+                                close_requested = true;
+                            }
+                            if !replicas.is_empty()
+                                && ui
+                                    .button("🗑 Очистить журнал")
+                                    .on_hover_text("Удалить все записи из журнала")
+                                    .clicked()
+                            {
+                                clear_all = true;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.separator();
+
                     if replicas.is_empty() {
+                        ui.add_space(16.0);
                         ui.centered_and_justified(|ui| {
-                            ui.label("Записей ещё нет. Зажмите F1 и поговорите, чтобы они появились здесь.");
+                            ui.label(format!(
+                                "Записей ещё нет.\nЗажмите {} и поговорите, чтобы они появились здесь.",
+                                hotkey_label(&settings)
+                            ));
                         });
                         return;
                     }
@@ -546,92 +846,216 @@ impl eframe::App for DictophoneApp {
                         ));
                     });
                     ui.add_space(6.0);
-                    ui.separator();
 
+                    // Список записей (новые сверху). Полный текст выбранной записи
+                    // раскрывается прямо в списке, так что прокрутка сохраняется,
+                    // а длинные тексты видны целиком.
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            // Отображаем новые записи сверху.
-                            for (idx, replica) in replicas.iter().rev().enumerate() {
-                                let global_idx = replicas.len() - 1 - idx;
-                                let when = replica.timestamp.format("%d.%m %H:%M");
-                                let words = replica.word_count;
-                                let app = if replica.app_name.trim().is_empty() {
-                                    " (неизвестное окно)".to_string()
-                                } else {
-                                    format!(" → {}", replica.app_name)
-                                };
-                                let preview = replica
-                                    .text
-                                    .as_deref()
-                                    .map(|t| {
-                                        let t = t.trim();
-                                        // Обрезаем по символам, а не по байтам:
-                                        // русский текст в UTF-8 давал панику «не граница
-                                        // символа» при вырезке &t[..60].
-                                        let head: String = t.chars().take(60).collect();
-                                        if t.chars().count() > 60 {
-                                            format!("{head}…")
+                            for replica in replicas.iter().rev() {
+                                let is_selected = self.selected_replica == Some(replica.id);
+
+                                // Карточка записи: клик по ней выделяет/раскрывает текст.
+                                let card_hover = ui.scope_builder(
+                                    egui::UiBuilder::new()
+                                        .id_salt(("journal_card", replica.id))
+                                        .sense(egui::Sense::click()),
+                                    |ui| {
+                                        let fill = if is_selected {
+                                            ui.visuals().widgets.active.bg_fill
                                         } else {
-                                            head
-                                        }
-                                    })
-                                    .unwrap_or_else(|| "(текст скрыт режимом приватности)".to_string());
+                                            ui.visuals().widgets.inactive.bg_fill
+                                        };
+                                        egui::Frame::NONE
+                                            .inner_margin(egui::Margin::symmetric(8, 6))
+                                            .corner_radius(6)
+                                            .fill(fill)
+                                            .show(ui, |ui| {
+                                                ui.set_min_width(ui.available_width());
+                                                entry_header_row(
+                                                    ui,
+                                                    replica,
+                                                    is_selected,
+                                                    &mut delete_id,
+                                                );
 
-                                ui.horizontal(|ui| {
-                                    let head = format!("[{when}] {words} слов{app}");
-                                    if ui.selectable_label(
-                                        self.selected_replica == Some(global_idx),
-                                        head,
-                                    ).clicked() {
-                                        self.selected_replica = Some(global_idx);
-                                    }
-                                });
-                                if !preview.is_empty() {
-                                    ui.label(preview);
+                                                // Текст записи: превью свёрнуто, полный текст — выбран.
+                                                let text = replica.text.as_deref();
+                                                if is_selected {
+                                                    if let Some(text) = text {
+                                                        egui::Frame::NONE
+                                                            .inner_margin(egui::Margin::symmetric(4, 4))
+                                                            .corner_radius(4)
+                                                            .fill(ui.visuals().extreme_bg_color)
+                                                            .show(ui, |ui| {
+                                                                ui.set_min_width(ui.available_width());
+                                                                ui.add(
+                                                                    egui::TextEdit::multiline(
+                                                                        &mut text.to_owned(),
+                                                                    )
+                                                                    .frame(egui::Frame::NONE)
+                                                                    .desired_width(f32::INFINITY)
+                                                                    .interactive(false),
+                                                                );
+                                                            });
+                                                    } else {
+                                                        ui.label("Текст скрыт (режим приватности).");
+                                                    }
+                                                } else if let Some(text) = text {
+                                                    let text = text.trim();
+                                                    if !text.is_empty() {
+                                                        let capped = cap_long_words(text, 60);
+                                                        let preview: String =
+                                                            if capped.chars().count() > 140 {
+                                                                let mut cut: String =
+                                                                    capped.chars().take(140).collect();
+                                                                cut.push('…');
+                                                                cut
+                                                            } else {
+                                                                capped
+                                                            };
+                                                        ui.label(
+                                                            egui::RichText::new(preview)
+                                                                .color(ui.visuals().weak_text_color()),
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                    },
+                                );
+                                // Клик в свободное место карточки — выбрать/раскрыть запись.
+                                if card_hover.response.clicked() && !is_selected {
+                                    self.selected_replica = Some(replica.id);
+                                } else if card_hover.response.clicked() && is_selected {
+                                    // Повторный клик по открытой записи — свернуть её.
+                                    self.selected_replica = None;
                                 }
-                                ui.separator();
+                                ui.add_space(6.0);
                             }
                         });
-
-                    // Полный текст выбранной записи.
-                    if let Some(idx) = self.selected_replica
-                        && let Some(replica) = replicas.get(idx)
-                    {
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.heading("Полный текст");
-                            if let Some(text) = &replica.text
-                                && ui.button("📋 Копировать").clicked()
-                            {
-                                ui.ctx().copy_text(text.clone());
-                            }
-                        });
-                        if let Some(text) = &replica.text {
-                            let mut text_clone = text.clone();
-                            egui::ScrollArea::vertical()
-                                .max_height(200.0)
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut text_clone)
-                                            .desired_width(f32::INFINITY)
-                                            .interactive(false),
-                                    );
-                                });
-                        } else {
-                            ui.label("Текст скрыт (режим приватности).");
-                        }
-                    }
                 });
 
-            // Пользователь закрыл окно крестиком.
-            if !open {
+            // Пользователь закрыл окно крестиком (своим или системным управлением).
+            if !open || close_requested {
                 self.show_journal = false;
                 self.selected_replica = None;
             }
+
+            // Применяем удаление записей после отрисовки окна.
+            if clear_all || delete_id.is_some() {
+                let remaining: Vec<ReplicaLog> = if clear_all {
+                    // Полная очистка журнала одной кнопкой.
+                    Vec::new()
+                } else if let Some(id) = delete_id {
+                    replicas.iter().filter(|r| r.id != id).cloned().collect()
+                } else {
+                    return;
+                };
+                if let Ok(mut s) = self.state.lock() {
+                    s.replicas = remaining.clone();
+                }
+                if let Some(path) = replica_log_path() {
+                    if remaining.is_empty() {
+                        stats_logger::clear_replicas(&path);
+                    } else {
+                        stats_logger::rewrite_replicas(&path, &remaining);
+                    }
+                }
+                if clear_all || delete_id == self.selected_replica {
+                    self.selected_replica = None;
+                }
+            }
         }
     }
+}
+
+/// Отрисовывает шапку карточки записи: метаданные слева, кнопки
+/// «копировать» и «удалить» справа.
+fn entry_header_row(
+    ui: &mut egui::Ui,
+    replica: &ReplicaLog,
+    is_selected: bool,
+    delete_id: &mut Option<uuid::Uuid>,
+) {
+    let when = replica.timestamp.format("%d.%m %H:%M");
+    let app = if replica.app_name.trim().is_empty() {
+        " (неизвестное окно)".to_string()
+    } else {
+        format!(" → {}", replica.app_name)
+    };
+    let duration = replica.duration_ms;
+
+    ui.horizontal(|ui| {
+        let head = if is_selected {
+            format!(
+                "[{when}] {words} слов · {ms} мс · {sec:.1} с{app}",
+                words = replica.word_count,
+                ms = duration,
+                sec = duration as f64 / 1000.0
+            )
+        } else {
+            format!(
+                "[{when}] {words} слов · {sec:.1} с{app}",
+                words = replica.word_count,
+                sec = duration as f64 / 1000.0
+            )
+        };
+
+        // Метаданные слева. Ширина ограничена, чтобы длинное имя окна
+        // (например, путь к файлу) не растягивало карточку и не выталкивало
+        // кнопки за правый край окна; полный текст показывается по наведению.
+        let reserved_buttons = 70.0;
+        let meta_width = (ui.available_width() - reserved_buttons).max(120.0);
+        let full_head = head.clone();
+        ui.add_sized(
+            egui::vec2(meta_width, ui.available_height()),
+            egui::Label::new(head).truncate(),
+        )
+        .on_hover_text(full_head);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            match replica.text.as_deref() {
+                Some(text) => {
+                    if ui
+                        .small_button("📋")
+                        .on_hover_text("Скопировать текст записи")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(text.to_owned());
+                    }
+                }
+                None => {
+                    ui.add_enabled(false, egui::Button::new("📋"))
+                        .on_hover_text("Текст скрыт (режим приватности)");
+                }
+            }
+            if ui
+                .small_button("🗑")
+                .on_hover_text("Удалить эту запись")
+                .clicked()
+            {
+                *delete_id = Some(replica.id);
+            }
+        });
+    });
+}
+
+/// Укорачивает «монолитные» слова (URL, длинные пути/имена) до `max_word`
+/// символов: в режиме переноса по словам такое слово иначе раздувает
+/// карточку шире окна и выталкивает кнопки за экран.
+fn cap_long_words(text: &str, max_word: usize) -> String {
+    text.split_whitespace()
+        .map(|word| {
+            if word.chars().count() > max_word {
+                let mut cut: String = word.chars().take(max_word).collect();
+                cut.push('…');
+                cut
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Команды, которыми поток горячих клавиш общается с диктофоном.
@@ -850,7 +1274,7 @@ fn main() -> eframe::Result {
 
     let mut app_state = AppState {
         devices,
-        settings,
+        settings: settings.clone(),
         status: initial_status,
         ..Default::default()
     };
@@ -863,8 +1287,8 @@ fn main() -> eframe::Result {
     // Канал команд от горячей клавиши к диктофону.
     let (key_tx, key_rx) = mpsc::channel::<KeyCommand>();
 
-    // Регистрируем глобальный хоткей F1 (работает независимо от активного окна).
-    let _hotkey_manager = register_f1_hotkey(state.clone(), key_tx);
+    // Регистрируем глобальный хоткей (работает независимо от активного окна).
+    let _hotkey_manager = create_hotkey_manager(&settings, &state, key_tx);
 
     // Запускаем диктофон в отдельном потоке, чтобы GUI оставался отзывчивым.
     let recorder_state = state.clone();
@@ -886,10 +1310,15 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Диктофон",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            // Обработчик событий трея живёт в отдельном потоке и возвращает
+            // окно из фона/завершает приложение, даже когда окно скрыто.
+            #[cfg(target_os = "windows")]
+            spawn_tray_event_handler(cc.egui_ctx.clone(), state.clone());
             Ok(Box::new(DictophoneApp::new(
                 app_state_for_frame,
                 open_settings,
+                _hotkey_manager,
             )))
         }),
     )
@@ -925,27 +1354,89 @@ fn read_settings(state: &Arc<Mutex<AppState>>) -> Settings {
     state.lock().map(|s| s.settings.clone()).unwrap_or_default()
 }
 
-/// Регистрирует глобальную горячую клавишу F1 и запускает поток,
+/// Строит горячую клавишу из настроек; при битом значении — F1.
+fn hotkey_from_settings(settings: &Settings) -> HotKey {
+    match settings.hotkey.trim().parse::<HotKey>() {
+        Ok(hotkey) => HotKey::new(None, hotkey.key),
+        Err(_) => HotKey::new(None, Code::F1),
+    }
+}
+
+/// Человекочитаемое имя горячей клавиши для интерфейса («F1», «F5»).
+fn hotkey_label(settings: &Settings) -> String {
+    hotkey_from_settings(settings).into_string()
+}
+
+/// Клавиши, которые можно назначить вызовом записи (F1–F24).
+///
+/// Обычные буквы/цифры не даём назначать: глобальная клавиша перехватывает
+/// символ по всей системе и сломала бы набор текста в других приложениях.
+fn egui_key_to_hotkey_code(key: egui::Key) -> Option<Code> {
+    use egui::Key as K;
+    use global_hotkey::hotkey::Code as C;
+    Some(match key {
+        K::F1 => C::F1,
+        K::F2 => C::F2,
+        K::F3 => C::F3,
+        K::F4 => C::F4,
+        K::F5 => C::F5,
+        K::F6 => C::F6,
+        K::F7 => C::F7,
+        K::F8 => C::F8,
+        K::F9 => C::F9,
+        K::F10 => C::F10,
+        K::F11 => C::F11,
+        K::F12 => C::F12,
+        K::F13 => C::F13,
+        K::F14 => C::F14,
+        K::F15 => C::F15,
+        K::F16 => C::F16,
+        K::F17 => C::F17,
+        K::F18 => C::F18,
+        K::F19 => C::F19,
+        K::F20 => C::F20,
+        K::F21 => C::F21,
+        K::F22 => C::F22,
+        K::F23 => C::F23,
+        K::F24 => C::F24,
+        _ => return None,
+    })
+}
+
+/// Регистрирует глобальную горячую клавишу и запускает поток,
 /// который превращает события нажатия/отпускания в команды диктофона.
-fn register_f1_hotkey(
-    state: Arc<Mutex<AppState>>,
+///
+/// Менеджер создаётся на главном потоке (там же жёстко сидит окно-приёмник
+/// системного хоткея), поэтому переназначается из GUI через
+/// `DictophoneApp::current_hotkey`. Смена клавиши в настройках применяется
+/// на лету, без перезапуска программы.
+fn create_hotkey_manager(
+    settings: &Settings,
+    state: &Arc<Mutex<AppState>>,
     key_tx: mpsc::Sender<KeyCommand>,
 ) -> Option<GlobalHotKeyManager> {
     let manager = match GlobalHotKeyManager::new() {
         Ok(manager) => manager,
         Err(err) => {
-            set_status(&state, format!("Ошибка горячих клавиш: {err}"));
+            set_status(state, format!("Ошибка горячих клавиш: {err}"));
             return None;
         }
     };
 
-    let hotkey = HotKey::new(None, Code::F1);
+    let hotkey = hotkey_from_settings(settings);
     if let Err(err) = manager.register(hotkey) {
-        set_status(&state, format!("Не удалось зарегистрировать F1: {err}"));
-        return None;
+        set_status(
+            state,
+            format!(
+                "Не удалось зарегистрировать клавишу {}: {err}",
+                hotkey_label(settings)
+            ),
+        );
     }
 
-    // Поток, следящий за событиями глобального хоткея.
+    // Поток, следящий за событиями глобального хоткея. Одновременно
+    // зарегистрирована только одна клавиша (старые снимаются перед новыми),
+    // поэтому любое пришедшее событие принадлежит текущей клавише.
     thread::spawn(move || {
         loop {
             while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
@@ -963,11 +1454,153 @@ fn register_f1_hotkey(
     Some(manager)
 }
 
-/// Основной цикл диктофона (режим удержания F1 или «вкл/выкл»).
+/// Показывает главное окно приложения (запрос из трея: клик по иконке или
+/// пункт «Открыть окно»). Отменяет возможный запрос закрытия, чтобы
+/// повторное появление окна не конфликтовало с режимом фона.
+#[cfg(target_os = "windows")]
+fn show_main_window(ctx: &egui::Context, state: &Arc<Mutex<AppState>>) {
+    if let Ok(mut s) = state.lock() {
+        s.hidden = false;
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.request_repaint();
+}
+
+/// Запускает полное завершение приложения из трея: ставит флаг выхода и
+/// закрывает окно. В следующем кадре обработчик закрытия видит `want_exit`
+/// и не прячет окно в трей — приложение завершается полностью.
+#[cfg(target_os = "windows")]
+fn quit_from_tray(ctx: &egui::Context, state: &Arc<Mutex<AppState>>) {
+    if let Ok(mut s) = state.lock() {
+        s.want_exit = true;
+    }
+    append_log(state, "Завершение работы из меню трея...".to_string());
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    ctx.request_repaint();
+}
+
+/// Фоновый поток событий трея.
+///
+/// Сам иконку не создаёт (её держит главный поток eframe — там работает
+/// цикл сообщений окна трея), а только отвечает на события из общих каналов
+/// `tray_icon`: клик по иконке или пункт меню «Открыть окно» возвращают окно
+/// на экран, пункт «Выход» полностью завершает приложение. Поток живёт всё
+/// время работы программы, поэтому команды работают и когда окно скрыто.
+#[cfg(target_os = "windows")]
+fn spawn_tray_event_handler(ctx: egui::Context, state: Arc<Mutex<AppState>>) {
+    use tray_icon::menu::MenuEvent;
+    use tray_icon::{MouseButton, TrayIconEvent};
+
+    thread::spawn(move || {
+        loop {
+            // Клик левой кнопкой по иконке — вернуть главное окно.
+            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                if matches!(
+                    event,
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                ) {
+                    show_main_window(&ctx, &state);
+                }
+            }
+
+            // Команды контекстного меню иконки.
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
+                if event.id == voiceai::tray::MENU_OPEN_ID {
+                    show_main_window(&ctx, &state);
+                } else if event.id == voiceai::tray::MENU_QUIT_ID {
+                    quit_from_tray(&ctx, &state);
+                }
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+}
+
+/// Открывает поток захвата, если он ещё не открыт или сменилось устройство.
+///
+/// Микрофон держим открытым только во время записи: между записями поток
+/// закрывается (`capture = None`), и приложение не слушает микрофон.
+fn open_capture_if_needed(
+    capture: &mut Option<CapturedCapture>,
+    capture_device: &mut Option<String>,
+    device_name: Option<&str>,
+    state: &Arc<Mutex<AppState>>,
+) {
+    let need_reopen = capture.is_none() || capture_device.as_deref() != device_name;
+    if !need_reopen {
+        return;
+    }
+    // Старый поток (если был открыт) закроется сам при переприсваивании.
+    *capture_device = None;
+    match capture_stream(device_name, state.clone()) {
+        Ok(new_capture) => {
+            // В новом канале уже могут ждать холостые сэмплы — выбрасываем их.
+            discard_pending(&new_capture.rx);
+            *capture = Some(new_capture);
+            *capture_device = device_name.map(String::from);
+        }
+        Err(err) => {
+            *capture = None;
+            append_log(state, format!("Ошибка записи: {err}"));
+            set_status(state, format!("Не удалось открыть микрофон: {err}"));
+        }
+    }
+}
+
+/// Состояние текущего отрезка записи в цикле диктофона.
+struct RecordingSession {
+    /// Накопленные моно-сэмплы текущей записи.
+    buffer: Vec<i16>,
+    /// Идёт ли сейчас запись (набор сэмплов в буфер).
+    active: bool,
+    /// Момент начала «хвоста» (клавиша отпущена) — дослушиваем остаток.
+    tail_start: Option<Instant>,
+    /// Экспоненциальная средняя уровня сигнала (для индикатора).
+    smoothed_level: f32,
+}
+
+/// Начинает запись: открывает микрофон (если нужно) и сбрасывает буфер.
+/// Возвращает `false`, если микрофон не удалось открыть — запись не началась.
+fn start_recording(
+    capture: &mut Option<CapturedCapture>,
+    capture_device: &mut Option<String>,
+    settings: &Settings,
+    state: &Arc<Mutex<AppState>>,
+    session: &mut RecordingSession,
+) -> bool {
+    open_capture_if_needed(
+        capture,
+        capture_device,
+        settings.input_device.as_deref(),
+        state,
+    );
+    if capture.is_none() {
+        return false;
+    }
+    // Отбрасываем сэмплы, накопленные до нажатия клавиши.
+    if let Some(c) = capture {
+        discard_pending(&c.rx);
+    }
+    session.buffer.clear();
+    session.active = true;
+    session.tail_start = None;
+    session.smoothed_level = 0.0;
+    set_level(state, 0.0);
+    set_recording(state, true);
+    true
+}
+
+/// Основной цикл диктофона (режим удержания клавиши или «вкл/выкл»).
 ///
 /// Живёт в отдельном потоке и только обновляет `AppState`, а GUI его считывает.
 /// Настройки (устройство ввода, режим клавиши, пунктуация) читает из общего
-/// состояния и применяет без перезапуска всей программы.
+/// состояния и применяет без перезапуска всей программы. Микрофон открывается
+/// только на время записи и закрывается сразу после неё.
 fn run_recorder(state: Arc<Mutex<AppState>>, key_rx: Receiver<KeyCommand>) {
     // Канал заданий на транскрибацию. Транскрибатор живёт в отдельном потоке,
     // чтобы не блокировать работу диктофона.
@@ -975,56 +1608,70 @@ fn run_recorder(state: Arc<Mutex<AppState>>, key_rx: Receiver<KeyCommand>) {
     let transcriber_state = state.clone();
     thread::spawn(move || run_transcriber(transcriber_state, transcribe_rx));
 
-    // Запускаем захват звука с выбранного (или устройства по умолчанию).
+    // Оборачиваем весь цикл диктофона в catch_unwind: паника в любом месте
+    // (запись, чтение настроек, работа с каналами) НЕ должна отравлять мьютекс
+    // и «убивать» GUI.
+    let state_for_log = state.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_recorder_inner(state, key_rx, transcribe_tx);
+    }));
+    if let Err(_panic) = result {
+        append_log(
+            &state_for_log,
+            "Критическая ошибка в потоке диктофона. \
+             Приложение продолжает работу, но запись может быть недоступна."
+                .to_string(),
+        );
+    }
+}
+
+fn run_recorder_inner(
+    state: Arc<Mutex<AppState>>,
+    key_rx: Receiver<KeyCommand>,
+    transcribe_tx: mpsc::Sender<TranscriptionJob>,
+) {
     let initial = read_settings(&state);
     let mut current_mode = initial.press_mode;
+    // Устройство, выбранное в настройках сейчас (для лога при смене) и устройство
+    // открытого потока захвата.
+    let mut current_device = initial.input_device.clone();
+    let mut capture_device: Option<String> = None;
+    let mut capture: Option<CapturedCapture> = None;
 
-    let mut capture = match capture_stream(initial.input_device.as_deref(), state.clone()) {
-        Ok(capture) => capture,
-        Err(err) => {
-            set_status(&state, format!("Ошибка записи: {err}"));
-            return;
-        }
+    // Готовность (B-02): микрофон закрыт и приложение ждёт нажатия клавиши.
+    append_log(
+        &state,
+        format!(
+            "Готов к записи. Зажмите {} и говорите. Микрофон включается только на время записи.",
+            hotkey_label(&initial)
+        ),
+    );
+
+    let mut session = RecordingSession {
+        buffer: Vec::new(),
+        active: false,
+        tail_start: None,
+        smoothed_level: 0.0,
     };
-    let mut current_device = initial.input_device;
-
-    // Готовность (B-02): микрофон открыт и приложение ждёт нажатия F1.
-    append_log(&state, "Готов к записи. Зажмите F1 и говорите.".to_string());
-
-    let mut buffer: Vec<i16> = Vec::new();
-    let mut recording = false;
-    let mut tail_start: Option<Instant> = None;
     let tail_duration = Duration::from_millis(200);
     let mut devices_refreshed_at = Instant::now();
     let devices_refresh = Duration::from_secs(2);
-    let mut smoothed_level: f32 = 0.0;
 
     loop {
         // Свежие настройки применяются уже в этой итерации.
         let settings = read_settings(&state);
 
-        // Сменилось устройство ввода — пересоздаём поток захвата.
+        // Сменилось устройство ввода — запоминаем новый выбор. Сам поток захвата
+        // пересоздастся при следующем нажатии клавиши (`open_capture_if_needed`).
         if settings.input_device != current_device {
-            match capture_stream(settings.input_device.as_deref(), state.clone()) {
-                Ok(new_capture) => {
-                    // В новом канале уже могут ждать холостые сэмплы — выбрасываем их.
-                    discard_pending(&new_capture.rx);
-                    capture = new_capture;
-                    current_device = settings.input_device.clone();
-                    append_log(
-                        &state,
-                        match &current_device {
-                            Some(name) => format!("Устройство ввода: {name}"),
-                            None => "Устройство ввода: по умолчанию".to_string(),
-                        },
-                    );
-                }
-                Err(err) => {
-                    // Устройство не открылось — оставляем старое и сообщаем (C-12, C-13).
-                    append_log(&state, format!("Ошибка смены устройства: {err}"));
-                    set_status(&state, format!("Не удалось сменить устройство: {err}"));
-                }
-            }
+            current_device = settings.input_device.clone();
+            append_log(
+                &state,
+                match &current_device {
+                    Some(name) => format!("Устройство ввода: {name}"),
+                    None => "Устройство ввода: по умолчанию".to_string(),
+                },
+            );
         }
 
         // Периодически обновляем список устройств ввода (C-05): новые
@@ -1042,8 +1689,8 @@ fn run_recorder(state: Arc<Mutex<AppState>>, key_rx: Receiver<KeyCommand>) {
 
         // Сменился режим клавиши во время записи — аккуратно завершаем отрезок.
         if settings.press_mode != current_mode {
-            if recording {
-                tail_start = Some(Instant::now());
+            if session.active {
+                session.tail_start = Some(Instant::now());
             }
             current_mode = settings.press_mode;
         }
@@ -1052,31 +1699,30 @@ fn run_recorder(state: Arc<Mutex<AppState>>, key_rx: Receiver<KeyCommand>) {
         while let Ok(cmd) = key_rx.try_recv() {
             match (cmd, settings.press_mode) {
                 (KeyCommand::Start, PressMode::PushToTalk) => {
-                    // Отбрасываем «холостые» сэмплы, накопленные до нажатия клавиши.
-                    discard_pending(&capture.rx);
-                    buffer.clear();
-                    recording = true;
-                    tail_start = None;
-                    smoothed_level = 0.0;
-                    set_level(&state, 0.0);
-                    set_recording(&state, true);
+                    let _ = start_recording(
+                        &mut capture,
+                        &mut capture_device,
+                        &settings,
+                        &state,
+                        &mut session,
+                    );
                 }
                 (KeyCommand::Stop, PressMode::PushToTalk) => {
                     // Клавиша отпущена — начинаем отсчёт короткого «хвоста».
-                    tail_start = Some(Instant::now());
+                    session.tail_start = Some(Instant::now());
                 }
                 (KeyCommand::Start, PressMode::Toggle) => {
-                    if recording {
+                    if session.active {
                         // Повторное нажатие — останавливаем запись.
-                        tail_start = Some(Instant::now());
+                        session.tail_start = Some(Instant::now());
                     } else {
-                        discard_pending(&capture.rx);
-                        buffer.clear();
-                        recording = true;
-                        tail_start = None;
-                        smoothed_level = 0.0;
-                        set_level(&state, 0.0);
-                        set_recording(&state, true);
+                        let _ = start_recording(
+                            &mut capture,
+                            &mut capture_device,
+                            &settings,
+                            &state,
+                            &mut session,
+                        );
                     }
                 }
                 (KeyCommand::Stop, PressMode::Toggle) => {
@@ -1086,48 +1732,57 @@ fn run_recorder(state: Arc<Mutex<AppState>>, key_rx: Receiver<KeyCommand>) {
         }
 
         // Если идёт запись — забираем сэмплы из потока и копим в буфер.
-        if recording {
-            let gain = settings.input_gain;
-            let mut new_count = 0usize;
-            while let Ok(sample) = capture.rx.try_recv() {
-                let amplified = if (gain - 1.0).abs() > 0.01 {
-                    ((sample as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32)) as i16
-                } else {
-                    sample
-                };
-                buffer.push(amplified);
-                new_count += 1;
-            }
-            // Индикатор уровня (C-07): экспоненциальная средняя RMS новых сэмплов.
-            if new_count > 0 {
-                let start = buffer.len() - new_count;
-                let count = new_count as f64;
-                let rms: f64 = (buffer[start..]
-                    .iter()
-                    .map(|&s| (s as f64 / i16::MAX as f64).powi(2))
-                    .sum::<f64>()
-                    / count)
-                    .sqrt();
-                let rms_f32 = rms as f32;
-                smoothed_level = smoothed_level.mul_add(0.6, rms_f32 * 0.4);
-                set_level(&state, smoothed_level);
+        if session.active {
+            if let Some(c) = &capture {
+                let gain = settings.input_gain;
+                let mut new_count = 0usize;
+                while let Ok(sample) = c.rx.try_recv() {
+                    let amplified = if (gain - 1.0).abs() > 0.01 {
+                        ((sample as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32)) as i16
+                    } else {
+                        sample
+                    };
+                    session.buffer.push(amplified);
+                    new_count += 1;
+                }
+                // Индикатор уровня (C-07): экспоненциальная средняя RMS новых сэмплов.
+                if new_count > 0 {
+                    let start = session.buffer.len() - new_count;
+                    let count = new_count as f64;
+                    let rms: f64 = (session.buffer[start..]
+                        .iter()
+                        .map(|&s| (s as f64 / i16::MAX as f64).powi(2))
+                        .sum::<f64>()
+                        / count)
+                        .sqrt();
+                    let rms_f32 = rms as f32;
+                    session.smoothed_level = session.smoothed_level.mul_add(0.6, rms_f32 * 0.4);
+                    set_level(&state, session.smoothed_level);
+                }
             }
 
             // Дослушиваем небольшой «хвост» после останова записи,
             // чтобы не обрезать последние звуки.
-            if let Some(start) = tail_start
+            if let Some(start) = session.tail_start
                 && start.elapsed() >= tail_duration
             {
-                recording = false;
-                tail_start = None;
+                session.active = false;
+                session.tail_start = None;
                 set_recording(&state, false);
-                smoothed_level = 0.0;
+                session.smoothed_level = 0.0;
                 set_level(&state, 0.0);
+
+                // Забираем параметры потока и сразу закрываем микрофон —
+                // до следующего нажатия приложение не слушает.
+                let sample_rate = capture.as_ref().map(|c| c.sample_rate).unwrap_or(0);
+                capture = None;
+                capture_device = None;
+
                 // Отправляем запись на транскрибацию с текущими настройками
                 // пунктуации, шумоподавления и сохранения аудио.
                 let keep_audio = settings.keep_audio;
                 if keep_audio {
-                    match save_wav(&buffer, capture.sample_rate, OUTPUT_FILE) {
+                    match save_wav(&session.buffer, sample_rate, OUTPUT_FILE) {
                         Ok(path) => {
                             append_log(
                                 &state,
@@ -1135,8 +1790,8 @@ fn run_recorder(state: Arc<Mutex<AppState>>, key_rx: Receiver<KeyCommand>) {
                             );
                             let _ = transcribe_tx.send(TranscriptionJob::Text {
                                 wav_path: path.to_string(),
-                                samples: buffer.clone(),
-                                sample_rate: capture.sample_rate,
+                                samples: session.buffer.clone(),
+                                sample_rate,
                                 auto_punctuation: settings.auto_punctuation,
                                 noise_reduction: settings.noise_reduction,
                                 keep_audio,
@@ -1155,43 +1810,82 @@ fn run_recorder(state: Arc<Mutex<AppState>>, key_rx: Receiver<KeyCommand>) {
                     );
                     let _ = transcribe_tx.send(TranscriptionJob::Text {
                         wav_path: OUTPUT_FILE.to_string(),
-                        samples: buffer.clone(),
-                        sample_rate: capture.sample_rate,
+                        samples: session.buffer.clone(),
+                        sample_rate,
                         auto_punctuation: settings.auto_punctuation,
                         noise_reduction: settings.noise_reduction,
                         keep_audio,
                     });
                 }
+                session.buffer.clear();
             }
-        } else {
-            // Если запись не идёт — постоянно выбрасываем холостые сэмплы.
-            discard_pending(&capture.rx);
         }
 
         thread::sleep(Duration::from_millis(1));
     }
 }
 
-/// Поток транскрибации: загружает модель Whisper один раз и расшифровывает записи.
+/// Кэш загруженных движков распознавания.
+///
+/// Модель грузим лениво (при первой записи) и держим загруженной, чтобы не
+/// платить за запуск при каждом нажатии F1. Сейчас загружен только выбранный
+/// в настройках движок — при переключении другой выгружается из памяти.
+#[derive(Default)]
+struct EngineCache {
+    /// Загруженный контекст Whisper (None — ещё не грузили или устарел).
+    whisper: Option<WhisperContext>,
+    /// Путь модели Whisper, которая сейчас в `whisper`. Сменился — перезагружаем.
+    whisper_model: Option<String>,
+    /// Загруженная модель GigaAM (None — ещё не грузили или устарела).
+    gigaam: Option<GigaAMModel>,
+    /// Папка модели GigaAM, которая сейчас в `gigaam`. Сменилась — перезагружаем.
+    gigaam_dir: Option<String>,
+}
+
+impl EngineCache {
+    /// Сверяет загруженные модели с настройками: если выбранный движок или
+    /// путь модели сменились — сбрасывает кэш (перезагрузка произойдёт
+    /// при следующей записи).
+    fn sync(&mut self, settings: &Settings) {
+        match settings.speech_engine {
+            SpeechEngine::Whisper => {
+                let resolved = resolve_model_path(settings.model_path.as_deref());
+                if resolved != self.whisper_model {
+                    // Модель сменилась или больше не находится — перезагружаем при следующей записи.
+                    self.whisper = None;
+                    self.whisper_model = resolved;
+                }
+                // Другой движок не нужен — освобождаем память.
+                self.gigaam = None;
+                self.gigaam_dir = None;
+            }
+            SpeechEngine::GigaAM => {
+                let resolved =
+                    models::resolve_gigaam_dir().map(|dir| dir.to_string_lossy().into_owned());
+                if resolved != self.gigaam_dir {
+                    self.gigaam = None;
+                    self.gigaam_dir = resolved;
+                }
+                self.whisper = None;
+                self.whisper_model = None;
+            }
+        }
+    }
+}
+
+/// Поток транскрибации: держит движок распознавания загруженным и расшифровывает записи.
 ///
 /// Поток живёт всё время работы программы. Даже если отдельная запись
 /// вызывает панику (например, не хватило памяти), поток переживает сбой и
 /// продолжает принимать новые записи — приложение не «молчит».
 fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) {
     // Модель грузим лениво (при первой записи), чтобы не тормозить запуск программы.
-    let mut context: Option<WhisperContext> = None;
-    // Какую модель сейчас загрузили (путь). Сменился путь — перезагружаем.
-    let mut loaded_model: Option<String> = None;
+    let mut cache = EngineCache::default();
 
     loop {
-        // Свежие настройки: путь к модели (B-08) и язык распознавания (B-09).
+        // Свежие настройки: движок, путь к модели (B-08) и язык распознавания (B-09).
         let settings = read_settings(&state);
-        let resolved_model = resolve_model_path(settings.model_path.as_deref());
-        if resolved_model != loaded_model {
-            // Модель сменилась или больше не находится — перезагружаем при следующей записи.
-            context = None;
-            loaded_model = resolved_model;
-        }
+        cache.sync(&settings);
 
         while let Ok(job) = rx.try_recv() {
             let TranscriptionJob::Text {
@@ -1206,6 +1900,7 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
             // Оборачиваем работу в catch_unwind: поток не должен умирать.
             let captured = settings.model_path.clone();
             let language = settings.language.clone();
+            let engine = settings.speech_engine;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 transcribe_and_save(
                     &wav_path,
@@ -1215,7 +1910,8 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
                     noise_reduction,
                     captured.as_deref(),
                     &language,
-                    &mut context,
+                    engine,
+                    &mut cache,
                 )
             }));
 
@@ -1241,7 +1937,7 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
                         append_log(
                             &state,
                             format!(
-                                "Расшифровка готова: {} (слов: {}). Запись: {} (длина {:.2} с, уровень {:.3}).{}\n  Сырой текст Whisper: {}\n  После обработки: {}",
+                                "Расшифровка готова: {} (слов: {}). Запись: {} (длина {:.2} с, уровень {:.3}).{}\n  Сырой текст: {}\n  После обработки: {}",
                                 outcome.txt_path,
                                 outcome.word_count,
                                 wav_path,
@@ -1304,7 +2000,7 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
                     );
                     // Перезагружаем модель заново — исходная могла остаться в
                     // недопустимом состоянии.
-                    context = None;
+                    cache = EngineCache::default();
                 }
             }
         }
@@ -1312,15 +2008,16 @@ fn run_transcriber(state: Arc<Mutex<AppState>>, rx: Receiver<TranscriptionJob>) 
     }
 }
 
-/// Расшифровывает запись через Whisper и записывает текст в .txt рядом с WAV.
+/// Расшифровывает запись выбранной моделью и записывает текст в .txt рядом с WAV.
 ///
 /// Возвращает результат с текстом, числом слов и диагностикой
-/// (0 слов — если Whisper не услышал речи). Если пост-обработка не
-/// справилась, пишется «сырой» текст Whisper, чтобы пользователь не
+/// (0 слов — если модель не услышала речи). Если пост-обработка не
+/// справилась, пишется «сырой» текст, чтобы пользователь не
 /// остался вообще без расшифровки.
 ///
-/// `model_override` — путь к модели из настроек (если задан), `language` —
-/// код языка или «auto» для автоопределения.
+/// Аудио готовится одинаково для обеих моделей (16 кГц моно f32), затем
+/// расшифровка идёт через выбранный движок. `model_override` — путь к модели
+/// Whisper из настроек (если задан), `language` — код языка или «auto».
 #[allow(clippy::too_many_arguments)]
 fn transcribe_and_save(
     wav_path: &str,
@@ -1330,14 +2027,81 @@ fn transcribe_and_save(
     noise_reduction: bool,
     model_override: Option<&str>,
     language: &str,
-    context: &mut Option<WhisperContext>,
+    engine: SpeechEngine,
+    cache: &mut EngineCache,
 ) -> Result<TranscribeOutcome, Box<dyn std::error::Error>> {
-    // Загружаем модель при первом использовании и переиспользуем её дальше.
+    // Обе модели ждут моно-аудио f32 с частотой 16 кГц: делаем ресемплинг,
+    // обрезаем тишину и нормализуем громкость для лучшего распознавания.
+    let resampled = audio::resample_to_whisper(samples, sample_rate);
+    let trimmed = audio::trim_silence(&resampled);
+    let mut audio = trimmed.to_vec();
+    // Шумоподавление (C-16) — по желанию, до нормализации громкости.
+    if noise_reduction {
+        audio::apply_noise_reduction(&mut audio);
+    }
+    audio::normalize_audio(&mut audio);
+
+    // Быстрое нажатие/отпускание клавиши даёт почти пустую запись: речи нет,
+    // но модели иногда «галлюцинируют» («Продолжение следует»). Если в звуке
+    // нет энергии — не вставляем ничего: пишем пустой txt и возвращаем 0 слов.
+    if !audio::has_speech_energy(&audio) {
+        return no_speech_outcome(wav_path, &audio);
+    }
+
+    // Очень короткая запись — это не слово, а щелчок/дребезг клавиши или
+    // случайный звук. Модель на таком обрывке «додумывает» правдоподобную
+    // фразу, поэтому отдаём ей только осмысленно длинный клип.
+    const MIN_SPEECH_SECONDS: f64 = 0.25;
+    if audio.len() as f64 / audio::TARGET_RATE < MIN_SPEECH_SECONDS {
+        return no_speech_outcome(wav_path, &audio);
+    }
+
+    let raw = match engine {
+        SpeechEngine::Whisper => {
+            transcribe_whisper(model_override, language, &mut cache.whisper, &audio)?
+        }
+        SpeechEngine::GigaAM => transcribe_gigaam(&mut cache.gigaam, &audio)?,
+    };
+
+    // Пост-обработка: чистка от слов-паразитов, пунктуация, абзацы.
+    // Если автоматическая пунктуация выключена, текст оставляем «как сказан».
+    let processed = postprocess::postprocess_text(&raw, auto_punctuation);
+    // Если пост-обработка «съела» текст, а в записи явно была речь — пишем
+    // исходный вариант, чтобы не потерять информацию.
+    let final_text = if !processed.trim().is_empty() {
+        processed
+    } else {
+        raw.trim().to_string()
+    };
+
+    let word_count = final_text.split_whitespace().count();
+
+    // Заменяем расширение .wav на .txt — txt окажется рядом с записью голоса.
+    let txt_path = replace_wav_extension(wav_path, "txt");
+    write_text_file(&txt_path, &final_text)?;
+
+    Ok(TranscribeOutcome {
+        txt_path,
+        word_count,
+        text: final_text,
+        raw_text: raw,
+        audio_secs: audio.len() as f64 / audio::TARGET_RATE,
+        signal_level: peak_amplitude(&audio),
+    })
+}
+
+/// Расшифровывает аудио через Whisper (GGML-модель). Контекст грузится при
+/// первом использовании и переиспользуется дальше.
+fn transcribe_whisper(
+    model_override: Option<&str>,
+    language: &str,
+    context: &mut Option<WhisperContext>,
+    audio: &[f32],
+) -> Result<String, Box<dyn std::error::Error>> {
     let ctx = match context {
         Some(ctx) => ctx,
         None => {
-            let model_path = resolve_model_path(model_override);
-            let model_path = match model_path {
+            let model_path = match resolve_model_path(model_override) {
                 Some(path) => path,
                 None => {
                     let message =
@@ -1357,33 +2121,6 @@ fn transcribe_and_save(
             context.insert(ctx)
         }
     };
-
-    // Whisper нужен аудио форматом f32 моно с частотой 16 кГц — делаем ресемплинг,
-    // обрезаем тишину и нормализуем громкость для лучшего распознавания.
-    let resampled = audio::resample_to_whisper(samples, sample_rate);
-    let trimmed = audio::trim_silence(&resampled);
-    let mut audio = trimmed.to_vec();
-    // Шумоподавление (C-16) — по желанию, до нормализации громкости.
-    if noise_reduction {
-        audio::apply_noise_reduction(&mut audio);
-    }
-    audio::normalize_audio(&mut audio);
-
-    // Быстрое нажатие/отпускание клавиши даёт почти пустую запись: речи нет,
-    // но Whisper иногда «галлюцинирует» («Продолжение следует»). Если в звуке
-    // нет энергии — не вставляем ничего: пишем пустой txt и возвращаем 0 слов.
-    if !audio::has_speech_energy(&audio) {
-        return no_speech_outcome(wav_path, &audio);
-    }
-
-    // Очень короткая запись — это не слово, а щелчок/дребезг клавиши или
-    // случайный звук. Whisper на таком обрывке «додумывает» правдоподобную
-    // фразу (например, вместо нажатой «как дела» — выдуманную «как же я
-    // ловил?»), поэтому отдаём модели только осмысленно длинный клип.
-    const MIN_SPEECH_SECONDS: f64 = 0.25;
-    if audio.len() as f64 / audio::TARGET_RATE < MIN_SPEECH_SECONDS {
-        return no_speech_outcome(wav_path, &audio);
-    }
 
     let mut state = ctx.create_state()?;
 
@@ -1406,7 +2143,7 @@ fn transcribe_and_save(
     // Не выдаём служебные/шумовые токены в текст — меньше мусора.
     params.set_suppress_nst(true);
 
-    state.full(params, &audio)?;
+    state.full(params, audio)?;
 
     // Собираем распознанный текст из всех сегментов.
     let mut raw = String::new();
@@ -1419,32 +2156,37 @@ fn transcribe_and_save(
             raw.push(' ');
         }
     }
+    Ok(raw)
+}
 
-    // Пост-обработка: чистка от слов-паразитов, пунктуация, абзацы.
-    // Если автоматическая пунктуация выключена, текст оставляем «как сказан».
-    let processed = postprocess::postprocess_text(&raw, auto_punctuation);
-    // Если пост-обработка «съела» текст, а в записи явно была речь — пишем
-    // исходный вариант Whisper, чтобы не потерять информацию.
-    let final_text = if !processed.trim().is_empty() {
-        processed
-    } else {
-        raw.trim().to_string()
+/// Расшифровывает аудио через GigaAM v3 e2e-ctc (ONNX). Модель грузится при
+/// первом использовании из папки, куда её скачал пользователь.
+fn transcribe_gigaam(
+    gigaam: &mut Option<GigaAMModel>,
+    audio: &[f32],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let model = match gigaam {
+        Some(model) => model,
+        None => {
+            let dir = match models::resolve_gigaam_dir() {
+                Some(dir) => dir,
+                None => {
+                    let message = "Модель GigaAM v3 не скачана. Откройте «Настройки → Модель \
+                                   распознавания» и нажмите «Скачать модель GigaAM v3»."
+                        .to_string();
+                    return Err(message.into());
+                }
+            };
+            // Ищем файл model.onnx (в папке модели он так и называется, см. models.rs).
+            let model = GigaAMModel::load(&dir, &Quantization::default())?;
+            gigaam.insert(model)
+        }
     };
 
-    let word_count = final_text.split_whitespace().count();
-
-    // Заменяем расширение .wav на .txt — txt окажется рядом с записью голоса.
-    let txt_path = replace_wav_extension(wav_path, "txt");
-    write_text_file(&txt_path, &final_text)?;
-
-    Ok(TranscribeOutcome {
-        txt_path,
-        word_count,
-        text: final_text,
-        raw_text: raw,
-        audio_secs: audio.len() as f64 / audio::TARGET_RATE,
-        signal_level: peak_amplitude(&audio),
-    })
+    // GigaAM e2e-ctc сам расставляет пунктуацию и понимает русскую речь,
+    // поэтому язык в настройках на него не влияет.
+    let result = model.transcribe(audio, &TranscribeOptions::default())?;
+    Ok(result.text)
 }
 
 /// Пишет текст в файл и проверяет, что запись действительно прошла.
@@ -1519,6 +2261,85 @@ fn set_status(state: &Arc<Mutex<AppState>>, status: String) {
     }
 }
 
+/// Обновляет прогресс скачивания модели (для полосы в окне настроек).
+fn set_download_progress(state: &Arc<Mutex<AppState>>, downloaded: u64, total: u64) {
+    if let Ok(mut s) = state.lock() {
+        s.download.downloaded = downloaded;
+        s.download.total = total;
+    }
+}
+
+/// Помечает, что скачивание модели остановлено (успех или ошибка).
+fn set_download_active(state: &Arc<Mutex<AppState>>, active: bool) {
+    if let Ok(mut s) = state.lock() {
+        s.download.active = active;
+    }
+}
+
+/// Запускает скачивание модели GigaAM v3 e2e-ctc в фоновом потоке.
+///
+/// Модель не входит в базовую поставку (в отличие от Whisper), её пользователь
+/// скачивает один раз из окна настроек. Прогресс пишется в `AppState.download`,
+/// по завершении — сообщение в журнал.
+fn start_gigaam_download(state: Arc<Mutex<AppState>>) {
+    {
+        if let Ok(mut s) = state.lock() {
+            s.download = DownloadState {
+                active: true,
+                downloaded: 0,
+                total: 0,
+            };
+        }
+    }
+
+    thread::spawn(move || {
+        let Some(dest_dir) = models::gigaam_download_dir() else {
+            append_log(
+                &state,
+                "Не удалось определить папку для модели GigaAM — запустите приложение из папки, \
+                 куда есть доступ на запись."
+                    .to_string(),
+            );
+            set_download_active(&state, false);
+            return;
+        };
+
+        append_log(
+            &state,
+            format!(
+                "Скачиваю модель GigaAM v3 (e2e-ctc) в {}...",
+                dest_dir.display()
+            ),
+        );
+
+        let model_dest = dest_dir.join(models::GIGAAM_MODEL_FILE);
+        let vocab_dest = dest_dir.join(models::GIGAAM_VOCAB_FILE);
+        let result = (|| -> Result<(), String> {
+            download::download_file(models::GIGAAM_MODEL_URL, &model_dest, |done, total| {
+                set_download_progress(&state, done, total);
+            })?;
+            // Словарь крошечный, отдельный прогресс для него не нужен.
+            download::download_file(models::GIGAAM_VOCAB_URL, &vocab_dest, |_, _| {})?;
+            Ok(())
+        })();
+
+        set_download_active(&state, false);
+        match result {
+            Ok(()) => append_log(
+                &state,
+                format!(
+                    "Модель GigaAM v3 скачана: {}. Выберите её в настройках как модель распознавания.",
+                    dest_dir.display()
+                ),
+            ),
+            Err(err) => append_log(
+                &state,
+                format!("Скачивание модели GigaAM не удалось: {err}"),
+            ),
+        }
+    });
+}
+
 /// Пишет строку в журнал `voiceai.log` (без статуса в окне).
 fn write_plain_log(message: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -1590,6 +2411,15 @@ struct CapturedCapture {
     _channels: usize,
     /// Сам поток захвата — держит микрофон открытым, пока жив.
     _stream: cpal::Stream,
+}
+
+impl Drop for CapturedCapture {
+    fn drop(&mut self) {
+        // Явно останавливаем поток (на Windows это WASAPI `audio_client.Stop()`).
+        // Без этого некоторые драйверы/Windows держат микрофон «активным» (индикатор
+        // прослушки не гаснет), даже когда `cpal::Stream` уже освобождён.
+        let _ = self._stream.pause();
+    }
 }
 
 /// Запускает поток записи с указанного устройства ввода (или по умолчанию).
@@ -1834,11 +2664,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_flags_override_gui() {
+    fn cli_runs_gui_without_flags() {
         assert!(matches!(parse_cli(&[]), CliAction::Run));
+        assert!(matches!(parse_cli(&["some.wav".into()]), CliAction::Run));
+        assert!(matches!(
+            parse_cli(&["--model".into(), "m.bin".into()]),
+            CliAction::Run
+        ));
+    }
+
+    #[test]
+    fn cli_version_flag_wins_over_help_order() {
+        // Первый же «флаг действия» решает: версия важнее справки.
         assert!(matches!(
             parse_cli(&["--version".into()]),
             CliAction::PrintVersion
+        ));
+        assert!(matches!(parse_cli(&["-V".into()]), CliAction::PrintVersion));
+        assert!(matches!(
+            parse_cli(&["-h".into(), "--version".into()]),
+            CliAction::PrintHelp
+        ));
+        assert!(matches!(
+            parse_cli(&["--version".into(), "-h".into()]),
+            CliAction::PrintVersion
+        ));
+    }
+
+    #[test]
+    fn cli_help_flag() {
+        assert!(matches!(
+            parse_cli(&["--help".into()]),
+            CliAction::PrintHelp
         ));
         assert!(matches!(parse_cli(&["-h".into()]), CliAction::PrintHelp));
     }

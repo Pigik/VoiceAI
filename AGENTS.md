@@ -59,17 +59,24 @@ cargo run --example transcribe_test -- test_russian.wav rу
 | `src/postprocess.rs` | Очистка текста | слова-паразиты, пунктуация, абзацы (`postprocess_text`) |
 | `src/settings.rs` | Настройки + `config.json` | `Settings`, `PressMode`, `LANGUAGE_CHOICES`, `load_settings`/`save_settings` |
 | `src/autostart.rs` | Автозапуск в Windows (реестр) | — |
-| `src/tray.rs` | Иконка в трее (Windows) | `create_tray`, `update_tray` |
+| `src/tray.rs` | Иконка в трее (Windows) | `create_tray`, `update_tray`, меню «Открыть окно»/«Выход» |
 | `src/single_instance.rs` | Одна копия приложения (порт-лок) | `SingleInstanceGuard` |
-| `src/analytics.rs` | Дневная статистика (записи, слова, задержка) | `calculate_daily_stats`, `export_to_csv` |
-| `src/stats_logger.rs` | Журнал реплик в JSONL (ротация до 200) | `ReplicaLog`, `log_replica`/`read_replicas` |
 | `build.rs` | Копирует модель + CUDA DLL рядом с exe (Windows) | — |
 | `examples/transcribe_test.rs` | Проверка распознавания без GUI | — |
 
 ## Поведение приложения, которое нельзя ломать
 
-- **Запись**: F1 старт/стоп (режимы `PushToTalk`/`Toggle`). После отпускания дослушивается
+- **Крестик окна (Windows) — это «свернуть в трей», а не выход**: при закрытии окна
+  посылается `CancelClose` + `Visible(false)`, приложение продолжает работать в фоне и
+  отвечать на F1. Полный выход — кнопка «Выход» в правом верхнем углу окна или пункт
+  меню трея (устанавливает `AppState.want_exit`, после чего закрытие уже не отменяется).
+  События трея (клик/меню) разбирает фоном `spawn_tray_event_handler` в `main.rs`; саму
+  иконку создаёт только главный поток eframe (там же цикл сообщений её скрытого окна).
+- **Запись**: горячая клавиша (по умолчанию F1, переназначается в настройках — только
+  F1…F24) старт/стоп (режимы `PushToTalk`/`Toggle`). После отпускания дослушивается
   «хвост» 200 мс, запись сохраняется в `output.wav`, уходит в фоновый поток транскрибации.
+  **Микрофон открывается только на время записи** (`open_capture_if_needed`/`start_recording`
+  в `main.rs`): между записями поток захвата закрывается, ничего не пишется и не слушается.
 - **Вставка текста — только на Windows и без буфера обмена**: `insert::insert_text_at_cursor`
   печатает текст через `SendInput` с `KEYEVENTF_UNICODE`. **НЕ возвращай это на clipboard+Ctrl+V**:
   сохранение/восстановление буфера вызывало гонку и вставку старого содержимого вместо распознанного текста.
@@ -98,11 +105,3 @@ cargo run --example transcribe_test -- test_russian.wav rу
 - **`build.rs`** копирует `ggml-large-v3-turbo.bin` и CUDA DLL в `target/<profile>` — модель должна лежать в корне проекта.
 - **Тест `single_instance::tests::second_guard_rejected_until_first_released` падает, если приложение уже запущено** (занятый порт). Это не связано с изменениями в коде.
 - Сборка/линковка с `--features cuda` требует окружение MSVC (см. `build.bat`).
-- **`LNK1136: повреждённый argsort.obj` / сбой whisper-rs-sys при любом `cargo`-вызове**:
-  у CMake-сборки whisper.cpp c CUDA параллельность по умолчанию 32, и на
-  многоядерных машинах объектные файлы портятся. Перед любым `cargo check`/`test`/`build`
-  на Windows выставляй пониженную параллельность:
-  ```powershell
-  $env:CMAKE_BUILD_PARALLEL_LEVEL = "8"   # затем cargo check / test / build
-  ```
-  Это не связано с изменением кода — лечится пересборкой с меньшим `--parallel`.

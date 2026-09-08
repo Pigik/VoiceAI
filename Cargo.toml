@@ -35,6 +35,12 @@ csv = "1"
 # arboard — работа с системным буфером обмена (копирование текста).
 arboard = "3"
 
+# transcribe-rs — вторая модель распознавания GigaAM v3 e2e-ctc (SberDevices,
+# русская речь с пунктуацией). Реализована через ONNX Runtime (feature `onnx`),
+# инференс — на CPU. Модель не входит в базовую поставку: её скачивает сам
+# пользователь из окна настроек (см. src/models.rs и src/download.rs).
+transcribe-rs = { version = "0.3", features = ["onnx"] }
+
 # whisper-rs — привязки Rust для whisper.cpp (локальная транскрибация голоса).
 # Бэкенд выбирается по платформе:
 #   - Windows: CUDA (вся тяжёлая работа уходит на видеокарту NVIDIA, на RTX 4060

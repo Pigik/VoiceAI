@@ -7,6 +7,8 @@
 pub mod analytics;
 pub mod audio;
 pub mod autostart;
+pub mod download;
+pub mod models;
 pub mod postprocess;
 pub mod settings;
 pub mod single_instance;

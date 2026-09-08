@@ -19,6 +19,22 @@ pub enum PressMode {
     Toggle,
 }
 
+/// Движок распознавания речи.
+///
+/// По умолчанию — Whisper (модель поставляется вместе с программой).
+/// GigaAM v3 e2e-ctc — опциональная модель (русская речь с пунктуацией),
+/// которую пользователь скачивает сам в окне настроек.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechEngine {
+    /// Whisper large-v3-turbo (GGML .bin, CUDA/Metal/CPU).
+    #[default]
+    Whisper,
+    /// GigaAM v3 e2e-ctc (ONNX, CPU).
+    #[serde(rename = "gigaam")]
+    GigaAM,
+}
+
 /// Доступные языки распознавания: код ISO и подпись для интерфейса.
 /// «auto» — автоопределение языка Whisper.
 pub const LANGUAGE_CHOICES: &[(&str, &str)] = &[
@@ -57,6 +73,10 @@ fn default_keep_audio() -> bool {
     true
 }
 
+fn default_hotkey() -> String {
+    "F1".to_string()
+}
+
 /// Пользовательские настройки приложения. Сериализуются в JSON в
 /// `config.json` и переживают обновление программы.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -67,12 +87,21 @@ pub struct Settings {
     /// Режим нажатия клавиши записи.
     #[serde(default)]
     pub press_mode: PressMode,
+    /// Горячая клавиша вызова записи (например, «F1», «F5»). Задаётся
+    /// в окне настроек нажатием клавиши; хранится строкой, понятной
+    /// global_hotkey (см. `HotKey::from_str`).
+    #[serde(default = "default_hotkey")]
+    pub hotkey: String,
     /// Автоматическая пунктуация распознанного текста (точки, абзацы).
     #[serde(default = "default_auto_punctuation")]
     pub auto_punctuation: bool,
     /// Язык распознавания: код ISO или «auto» для автоопределения.
     #[serde(default = "default_language")]
     pub language: String,
+    /// Движок распознавания: Whisper (по умолчанию) или GigaAM v3 e2e-ctc.
+    /// Для GigaAM язык распознавания не используется — модель понимает русскую речь.
+    #[serde(default)]
+    pub speech_engine: SpeechEngine,
     /// Путь к файлу модели Whisper. `None` — автоматический поиск
     /// (переменная WHISPER_MODEL, папка с программой, текущая папка, models/).
     #[serde(default)]
@@ -100,8 +129,10 @@ impl Default for Settings {
         Self {
             input_device: None,
             press_mode: PressMode::PushToTalk,
+            hotkey: default_hotkey(),
             auto_punctuation: true,
             language: default_language(),
+            speech_engine: SpeechEngine::Whisper,
             model_path: None,
             auto_start: false,
             input_gain: default_input_gain(),
@@ -258,6 +289,8 @@ pub fn import_settings(from_path: &str) -> Result<Settings, String> {
 mod tests {
     use super::*;
 
+    /// «Старый» файл настроек (только три первых поля) должен читаться:
+    /// новые поля получают значения по умолчанию.
     #[test]
     fn old_config_reads_with_defaults() {
         let old = r#"{
@@ -268,18 +301,26 @@ mod tests {
         let settings = parse_settings(old).expect("старый конфиг читается");
         assert_eq!(settings.input_device.as_deref(), Some("Микрофон"));
         assert_eq!(settings.press_mode, PressMode::Toggle);
+        assert_eq!(settings.hotkey, "F1");
         assert!(!settings.auto_punctuation);
         assert_eq!(settings.language, "ru");
+        assert_eq!(settings.speech_engine, SpeechEngine::Whisper);
         assert_eq!(settings.model_path, None);
+        assert!(!settings.auto_start);
+        assert!(!settings.noise_reduction);
+        assert!(settings.keep_audio);
     }
 
+    /// Полный файл настроек читается и сохраняется без потерь.
     #[test]
     fn round_trip_keeps_values() {
         let settings = Settings {
             input_device: Some("Переговорка".to_string()),
             press_mode: PressMode::Toggle,
+            hotkey: "F5".to_string(),
             auto_punctuation: false,
             language: "en".to_string(),
+            speech_engine: SpeechEngine::GigaAM,
             model_path: Some("D:\\models\\whisper.bin".to_string()),
             auto_start: true,
             input_gain: 1.5,
@@ -290,5 +331,60 @@ mod tests {
         let json = to_json(&settings).expect("сериализация");
         let parsed = parse_settings(&json).expect("обратная сериализация");
         assert_eq!(parsed, settings);
+        assert!(json.contains("auto_start"));
+    }
+
+    /// Некорректное значение поля даёт понятную ошибку, а не панику.
+    #[test]
+    fn bad_value_gives_clear_error() {
+        let bad = r#"{ "press_mode": "Turbo" }"#;
+        let err = parse_settings(bad).expect_err("неверное значение отклоняется");
+        assert!(err.contains("Некорректное значение"), "ошибка: {err}");
+    }
+
+    /// Движок распознавания сериализуется в «человеческий» json.
+    #[test]
+    fn speech_engine_serializes_as_string() {
+        let giga = parse_settings(r#"{ "speech_engine": "gigaam" }"#).expect("gigaam читается");
+        assert_eq!(giga.speech_engine, SpeechEngine::GigaAM);
+        let whisper =
+            parse_settings(r#"{ "speech_engine": "whisper" }"#).expect("whisper читается");
+        assert_eq!(whisper.speech_engine, SpeechEngine::Whisper);
+    }
+
+    /// Синтаксически битый JSON тоже даёт понятную ошибку.
+    #[test]
+    fn broken_json_gives_clear_error() {
+        let err = parse_settings("{ press_mode: ").expect_err("битый JSON отклоняется");
+        assert!(err.contains("Синтаксическая ошибка"), "ошибка: {err}");
+    }
+
+    /// В импортируемом профиле те же проверки, что и в основном файле.
+    #[test]
+    fn import_validates_like_regular_config() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("voiceai_test_import.json");
+        let json = r#"{ "auto_punctuation": "yes" }"#;
+        std::fs::write(&path, json).expect("запись тестового файла");
+        let result = import_settings(&path.to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+        let message = result.unwrap_err();
+        assert!(message.contains("Некорректный профиль"));
+    }
+
+    /// Экспорт создаёт файл, который потом можно импортировать.
+    #[test]
+    fn export_then_import_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("voiceai_test_profile.json");
+        let settings = Settings {
+            auto_punctuation: false,
+            ..Settings::default()
+        };
+        export_settings(&path.to_string_lossy(), &settings).expect("экспорт");
+        let imported = import_settings(&path.to_string_lossy()).expect("импорт");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(imported, settings);
     }
 }

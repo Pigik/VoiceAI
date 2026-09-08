@@ -65,6 +65,25 @@ fn enforce_log_limit(path: &std::path::Path) {
     }
 }
 
+/// Перезаписывает файл журнала целиком списком записей (одна строка на запись).
+///
+/// Используется при удалении отдельных записей и при полной очистке журнала.
+pub fn rewrite_replicas(path: &std::path::Path, entries: &[ReplicaLog]) {
+    let Ok(mut file) = std::fs::File::create(path) else {
+        return;
+    };
+    for entry in entries {
+        if let Ok(json_line) = serde_json::to_string(entry) {
+            let _ = writeln!(file, "{json_line}");
+        }
+    }
+}
+
+/// Полностью удаляет файл журнала (все записи с диска).
+pub fn clear_replicas(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +132,39 @@ mod tests {
         assert_eq!(read.len(), 1);
         assert!(read[0].text.is_none());
         assert_eq!(read[0].word_count, 3);
+    }
+
+    #[test]
+    fn rewrite_and_clear() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("voiceai_test_replicas_rewrite.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let make = |words: usize, text: &str| ReplicaLog {
+            id: Uuid::new_v4(),
+            timestamp: Local::now(),
+            app_name: "Тест".to_string(),
+            duration_ms: 1000,
+            word_count: words,
+            text: Some(text.to_string()),
+            wpm: 180.0,
+        };
+        let a = make(1, "один");
+        let b = make(2, "два");
+
+        log_replica(&path, a.clone(), false);
+        log_replica(&path, b.clone(), false);
+        assert_eq!(read_replicas(&path).len(), 2);
+
+        // Перезапись без первой записи — как при её удалении.
+        rewrite_replicas(&path, std::slice::from_ref(&b));
+        let rest = read_replicas(&path);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].text.as_deref(), Some("два"));
+
+        // Полная очистка — файл исчезает, чтение даёт пустой список.
+        clear_replicas(&path);
+        assert!(!path.exists());
+        assert!(read_replicas(&path).is_empty());
     }
 }

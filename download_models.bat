@@ -5,10 +5,17 @@ rem Если файл уже скачан и его контрольная су�
 rem скачивание не выполняется (кеш переиспользуется). При повреждённом файле
 rem модель скачивается заново.
 rem
-rem Использование:  .\download_models.bat
+rem Первоисточник — собственный GitHub Release проекта: ссылка на такой asset
+rem не протухает, пока жив репозиторий. HuggingFace остаётся запасным
+rem источником только для «нулевого» релиза, когда модели в Release ещё нет.
+rem
+rem Использование:
+rem   .\download_models.bat
+rem   .\download_models.bat "https://github.com/OWNER/REPO/releases/download/v1.0.0"
 setlocal
 
-set "BASE=https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+set "BASE=%~1"
+if "%BASE%"=="" set "BASE=https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 set "MAIN=ggml-large-v3-turbo.bin"
 set "MAIN_SHA256=1FC70F774D38EB169993AC391EEA357EF47C88757EF72EE5943879B7E8E2BC69"
 

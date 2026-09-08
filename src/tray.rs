@@ -2,15 +2,35 @@
 //!
 //! Иконка создаётся на главном потоке (внутри цикла eframe), а её вид и
 //! подсказка отражают состояние записи: синий кружок — ожидание, красный —
-//! идёт запись. События иконки сообщать не нужно: приложение и так
-//! перерисовывается каждые 50 мс.
+//! идёт запись. Контекстное меню иконки возвращает скрытое окно на экран
+//! («Открыть окно») или полностью завершает приложение («Выход») — команды
+//! разбирает фоновый поток `spawn_tray_event_handler` в main.rs.
 
 #![cfg(target_os = "windows")]
 
+use tray_icon::menu::{Menu, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 /// Размер стороны иконки в пикселях (трей рисует её сам в нужном масштабе).
 const ICON_SIZE: u32 = 32;
+
+/// Идентификатор пункта меню «Открыть окно» — по нему обработчик событий
+/// трея в main.rs отличает команды меню друг от друга.
+pub const MENU_OPEN_ID: &str = "voiceai-tray-open";
+/// Идентификатор пункта меню «Выход».
+pub const MENU_QUIT_ID: &str = "voiceai-tray-quit";
+
+/// Собирает контекстное меню иконки: вернуть окно из фона или выйти.
+fn build_menu() -> Result<Menu, String> {
+    let open = MenuItem::with_id(MENU_OPEN_ID, "Открыть окно", true, None);
+    let quit = MenuItem::with_id(MENU_QUIT_ID, "Выход", true, None);
+    let menu = Menu::new();
+    menu.append(&open)
+        .map_err(|err| format!("Не удалось добавить пункт меню: {err}"))?;
+    menu.append(&quit)
+        .map_err(|err| format!("Не удалось добавить пункт меню: {err}"))?;
+    Ok(menu)
+}
 
 /// Рисует «микрофон»-кружок: синий в ожидании, красный во время записи.
 fn build_icon(recording: bool) -> Icon {
@@ -49,16 +69,18 @@ fn build_icon(recording: bool) -> Icon {
     Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE).expect("иконка трея имеет валидный размер")
 }
 
-/// Создаёт иконку в системном трее с текущим состоянием записи.
+/// Создаёт иконку в системном трее с текущим состоянием записи и меню.
 pub fn create_tray(recording: bool) -> Result<TrayIcon, String> {
+    let menu = build_menu()?;
     let tooltip = if recording {
         "VoiceAI — идёт запись"
     } else {
-        "VoiceAI — готов к записи (F1)"
+        "VoiceAI — готов к записи"
     };
     TrayIconBuilder::new()
         .with_tooltip(tooltip)
         .with_icon(build_icon(recording))
+        .with_menu(Box::new(menu))
         .build()
         .map_err(|err| format!("Не удалось создать иконку в трее: {err}"))
 }
@@ -68,7 +90,7 @@ pub fn update_tray(tray: &TrayIcon, recording: bool) {
     let tooltip = if recording {
         "VoiceAI — идёт запись"
     } else {
-        "VoiceAI — готов к записи (F1)"
+        "VoiceAI — готов к записи"
     };
     let _ = tray.set_icon(Some(build_icon(recording)));
     let _ = tray.set_tooltip(Some(tooltip));

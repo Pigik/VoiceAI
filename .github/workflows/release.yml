@@ -10,6 +10,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег для публикации при ручном запуске (например v1.0.0). Оставьте пустым, чтобы только собрать артефакт."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -21,6 +26,14 @@ jobs:
     steps:
       - name: Проверка исходников
         uses: actions/checkout@v4
+
+      - name: Определение тега релиза
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.tag }}"
+          if (-not $tag) { $tag = "${{ github.ref_name }}" }
+          "NEW_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Output "Тег релиза: $tag"
 
       - name: Настройка Rust (1.95 из rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@1.95.0
@@ -64,8 +77,21 @@ jobs:
           "$($cuda.FullName)\bin;$($cuda.FullName)\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append
           Write-Output "Используется CUDA: $($cuda.FullName)"
 
-      - name: Скачивание модели Whisper
-        run: .\download_models.bat
+      # Качаем модель из нашего же GitHub Release: после первой публикации она
+      # прикреплена отдельным asset'ом и живёт, пока жив репозиторий. HuggingFace
+      # нужен только как bootstrap для первого релиза, когда ещё нет ни одного
+      # опубликованного релиза с моделью.
+      - name: Скачивание модели Whisper (свой GitHub Release)
+        shell: pwsh
+        run: |
+          $rel = "https://github.com/${{ github.repository }}/releases/download/$env:NEW_TAG/ggml-large-v3-turbo.bin"
+          Write-Output "Пробуем GitHub Release: $rel"
+          .\download_models.bat "$rel"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "В GitHub Release модели пока нет (первый релиз) — используем HuggingFace."
+            .\download_models.bat
+            if ($LASTEXITCODE -ne 0) { throw "ОШИБКА: модель не скачана ни из GitHub Release, ни с HuggingFace" }
+          }
 
       # build.rs сам кладёт модель и DLL CUDA рядом с exe в target\release.
       - name: Сборка релиза (CUDA)
@@ -89,8 +115,14 @@ jobs:
           if-no-files-found: error
 
       - name: Публикация в GitHub Release (по тегу v*)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/VoiceAI-windows-x64.zip
+          tag_name: ${{ env.NEW_TAG }}
+          # Модель идёт вторым asset'ом, чтобы будущие релизы и те, кто
+          # собирает из исходников, качали её из того же Release, а не
+          # с HuggingFace.
+          files: |
+            dist/VoiceAI-windows-x64.zip
+            ggml-large-v3-turbo.bin
           draft: true
