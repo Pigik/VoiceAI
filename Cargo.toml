@@ -2,6 +2,10 @@
 name = "VoiceAI"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
+description = "Диктофон с локальным распознаванием речи (Whisper / GigaAM)"
+license = "MIT"
+repository = "https://github.com/Pigik/VoiceAI"
 
 # Имя библиотеки в нижнем регистре, чтобы в коде писать `use voiceai::...`.
 [lib]
@@ -25,15 +29,10 @@ eframe = { version = "0.36", default-features = false, features = ["glow", "defa
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# chrono — работа с датой/временем для логирования статистики
+# chrono — дата и время записей журнала и строк voiceai.log.
 chrono = { version = "0.4", features = ["serde"] }
-# uuid — генерация уникальных идентификаторов для логов
+# uuid — уникальные идентификаторы записей журнала реплик.
 uuid = { version = "1", features = ["v4", "serde"] }
-# csv — экспорт статистики в CSV
-csv = "1"
-
-# arboard — работа с системным буфером обмена (копирование текста).
-arboard = "3"
 
 # transcribe-rs — вторая модель распознавания GigaAM v3 e2e-ctc (SberDevices,
 # русская речь с пунктуацией). Реализована через ONNX Runtime (feature `onnx`),
@@ -53,12 +52,21 @@ whisper-rs = { version = "0.16", features = ["cuda"] }
 tray-icon = "0.24"
 # winreg — автозапуск через реестр Windows (ключ HKCU\...\Run).
 winreg = "0.55"
-# windows-sys — диалог «приложение уже запущено» (MessageBox) и ввод текста
-# через SendInput с KEYEVENTF_UNICODE (вставка без буфера обмена).
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+# arboard — системный буфер обмена: запасной путь, если вставить текст
+# в окно не удалось.
+arboard = "3"
+# windows-sys — диалог «приложение уже запущено» (MessageBox), заголовок
+# активного окна, вывод --help/--version в консоль и ввод текста через
+# SendInput с KEYEVENTF_UNICODE (вставка без буфера обмена).
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-whisper-rs = { version = "0.16" }
+whisper-rs = "0.16"

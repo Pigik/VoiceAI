@@ -37,7 +37,7 @@ jobs:
           "NEW_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Output "Тег релиза: $tag"
 
-      - name: Настройка Rust (1.95 из rust-toolchain.toml)
+      - name: Настройка Rust (версия из rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Кеш зависимостей
@@ -97,14 +97,15 @@ jobs:
           "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           Write-Output "Используется CUDA: $cudaPath"
 
-      # Качаем модель из нашего же GitHub Release: после первой публикации она
-      # прикреплена отдельным asset'ом и живёт, пока жив репозиторий. HuggingFace
-      # нужен только как bootstrap для первого релиза, когда ещё нет ни одного
-      # опубликованного релиза с моделью.
+      # Качаем модель из последнего опубликованного GitHub Release проекта: она
+      # прикреплена к нему отдельным asset'ом и живёт, пока жив репозиторий.
+      # Скрипт добавляет имя файла к адресу сам, поэтому передаём только базу.
+      # HuggingFace — запасной источник, пока опубликованного релиза с моделью
+      # ещё нет (релизы создаются черновиками: их нужно опубликовать вручную).
       - name: Скачивание модели Whisper (свой GitHub Release)
         shell: pwsh
         run: |
-          $rel = "https://github.com/${{ github.repository }}/releases/download/$env:NEW_TAG/ggml-large-v3-turbo.bin"
+          $rel = "https://github.com/${{ github.repository }}/releases/latest/download"
           Write-Output "Пробуем GitHub Release: $rel"
           .\download_models.bat "$rel"
           if ($LASTEXITCODE -ne 0) {

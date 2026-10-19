@@ -17,7 +17,7 @@ pub const GIGAAM_MODEL_FILE: &str = "model.onnx";
 /// Имя файла словаря внутри папки (ожидается transcribe-rs).
 pub const GIGAAM_VOCAB_FILE: &str = "vocab.txt";
 
-/// Адрес модели GigaAM v3 e2e-ctc в int8 (лучший выбор для CPU, ~225 МБ).
+/// Адрес модели GigaAM v3 e2e-ctc в int8 (лучший выбор для CPU, ~215 МБ).
 pub const GIGAAM_MODEL_URL: &str =
     "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/v3_e2e_ctc.int8.onnx";
 /// Адрес словаря модели.
@@ -51,21 +51,20 @@ pub fn resolve_gigaam_dir() -> Option<PathBuf> {
         .find(|dir| dir.join(GIGAAM_MODEL_FILE).is_file() && dir.join(GIGAAM_VOCAB_FILE).is_file())
 }
 
-/// Папка по умолчанию, куда скачивается модель GigaAM (создаётся при
-/// необходимости). Приоритет — папка данных приложения (переживает обновления),
-/// запасной вариант — models/giga-am-v3 в текущей папке.
-pub fn gigaam_download_dir() -> Option<PathBuf> {
-    if let Some(config) = crate::settings::config_dir() {
-        return Some(config.join(GIGAAM_DIR_NAME));
-    }
-    Some(PathBuf::from("models").join(GIGAAM_DIR_NAME))
+/// Папка, куда скачивается модель GigaAM (создаётся при скачивании).
+/// Приоритет — папка данных приложения (переживает обновления), запасной
+/// вариант — models/giga-am-v3 в текущей папке.
+pub fn gigaam_download_dir() -> PathBuf {
+    crate::settings::config_dir()
+        .map(|config| config.join(GIGAAM_DIR_NAME))
+        .unwrap_or_else(|| PathBuf::from("models").join(GIGAAM_DIR_NAME))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Все кандидаты на поиск — папки с именем GigaAM, начинающиеся с неё.
+    /// Все кандидаты на поиск — папки с именем модели GigaAM.
     #[test]
     fn all_candidates_are_gigaam_dirs() {
         let candidates = gigaam_dir_candidates();

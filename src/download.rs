@@ -12,9 +12,23 @@ use std::time::Duration;
 /// Интервал опроса размера скачиваемого файла (для обновления прогресса).
 const POLL_INTERVAL: Duration = Duration::from_millis(120);
 
+/// Команда `curl`. На Windows запускаем её без консольного окна: приложение
+/// графическое, и иначе на всё время скачивания открывалось бы окно консоли.
+fn curl_command() -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new("curl");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Доступен ли `curl` в системе (Windows 10+ и macOS — да, по умолчанию).
 fn curl_available() -> bool {
-    Command::new("curl")
+    curl_command()
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -24,8 +38,8 @@ fn curl_available() -> bool {
 }
 
 /// Размер удалённого файла в байтах через HTTP HEAD (0 — размер неизвестен).
-pub fn remote_size(url: &str) -> u64 {
-    let Ok(output) = Command::new("curl").args(["-sIL", url]).output() else {
+fn remote_size(url: &str) -> u64 {
+    let Ok(output) = curl_command().args(["-sIL", url]).output() else {
         return 0;
     };
     let text = String::from_utf8_lossy(&output.stdout);
@@ -77,14 +91,19 @@ pub fn download_file(url: &str, dest: &Path, on_progress: impl Fn(u64, u64)) -> 
     tmp_name.push(".part");
     let tmp = dest.with_file_name(tmp_name);
 
-    // -sS: без прогресс-бара самого curl, но с выводом ошибок;
+    // --silent --show-error: без прогресс-бара самого curl, но с текстом ошибки;
     // --fail: ненулевой код при 4xx/5xx; --location: идём за редиректами
-    // (huggingface отдаёт файлы через редирект на CDN).
-    let mut child = Command::new("curl")
+    // (huggingface отдаёт файлы через редирект на CDN); --retry: переживаем
+    // кратковременные сбои сети.
+    let mut child = curl_command()
         .args(["--fail", "--location", "--silent", "--show-error"])
+        .args(["--retry", "3"])
         .arg("--output")
         .arg(&tmp)
         .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("Не удалось запустить curl: {err}"))?;
 
@@ -94,12 +113,17 @@ pub fn download_file(url: &str, dest: &Path, on_progress: impl Fn(u64, u64)) -> 
         thread::sleep(POLL_INTERVAL);
     }
 
-    let status = child
-        .wait()
+    let output = child
+        .wait_with_output()
         .map_err(|err| format!("Ошибка ожидания curl: {err}"))?;
-    if !status.success() {
+    if !output.status.success() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("Скачивание не удалось (curl: {status})"));
+        let details = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Скачивание не удалось (curl: {}) {}",
+            output.status,
+            details.trim()
+        ));
     }
 
     let len = std::fs::metadata(&tmp).map(|meta| meta.len()).unwrap_or(0);

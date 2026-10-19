@@ -3,7 +3,7 @@
 //! Настройки сериализуются в человекочитаемый JSON (см. `config_path`),
 //! поэтому файл можно править текстовым редактором, а схема переживает
 //! обновление программы: новые поля получают значения по умолчанию.
-//! Хранится файл вне папки с программой (см. раздел «Настройки» в README).
+//! Хранится файл вне папки с программой (см. раздел «Конфигурация» в README).
 
 use std::path::PathBuf;
 
@@ -21,7 +21,7 @@ pub enum PressMode {
 
 /// Движок распознавания речи.
 ///
-/// По умолчанию — Whisper (модель поставляется вместе с программой).
+/// По умолчанию — Whisper (модель входит в готовый архив с программой).
 /// GigaAM v3 e2e-ctc — опциональная модель (русская речь с пунктуацией),
 /// которую пользователь скачивает сам в окне настроек.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,10 +119,14 @@ pub struct Settings {
     /// `false` — запись расшифровывается «из памяти», файл не создаётся.
     #[serde(default = "default_keep_audio")]
     pub keep_audio: bool,
-
+    /// Режим приватности: текст расшифровок не сохраняется в журнале реплик
+    /// и в `voiceai.log` (статистика и число слов остаются).
     #[serde(default)]
     pub privacy_mode: bool,
 }
+
+/// Допустимый диапазон усиления входа (как у ползунка в окне настроек).
+pub const INPUT_GAIN_RANGE: std::ops::RangeInclusive<f32> = 0.0..=4.0;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -130,7 +134,7 @@ impl Default for Settings {
             input_device: None,
             press_mode: PressMode::PushToTalk,
             hotkey: default_hotkey(),
-            auto_punctuation: true,
+            auto_punctuation: default_auto_punctuation(),
             language: default_language(),
             speech_engine: SpeechEngine::Whisper,
             model_path: None,
@@ -158,7 +162,7 @@ pub struct LoadOutcome {
 ///
 /// Windows: `%APPDATA%\VoiceAI`, macOS/Linux: `~/.config/VoiceAI`. Хранится
 /// вне папки с программой, поэтому обновление приложения поверх старой версии
-/// не сбрасывает настройки (см. раздел «Установка поверх...» в README).
+/// не сбрасывает настройки (см. раздел «Конфигурация» в README).
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -239,7 +243,16 @@ pub fn load_settings() -> LoadOutcome {
 /// Разбирает JSON-текст настроек. Возвращает понятное сообщение об ошибке,
 /// если файл синтаксически повреждён или содержит некорректные значения.
 pub fn parse_settings(text: &str) -> Result<Settings, String> {
-    serde_json::from_str::<Settings>(text).map_err(describe_config_error)
+    let settings = serde_json::from_str::<Settings>(text).map_err(describe_config_error)?;
+    if !settings.input_gain.is_finite() || !INPUT_GAIN_RANGE.contains(&settings.input_gain) {
+        return Err(format!(
+            "Некорректное значение поля input_gain: {} (допустимо от {} до {})",
+            settings.input_gain,
+            INPUT_GAIN_RANGE.start(),
+            INPUT_GAIN_RANGE.end()
+        ));
+    }
+    Ok(settings)
 }
 
 /// Превращает ошибку serde_json в человекочитаемый текст.
@@ -350,6 +363,14 @@ mod tests {
         let whisper =
             parse_settings(r#"{ "speech_engine": "whisper" }"#).expect("whisper читается");
         assert_eq!(whisper.speech_engine, SpeechEngine::Whisper);
+    }
+
+    /// Усиление вне допустимого диапазона отклоняется с понятной ошибкой.
+    #[test]
+    fn out_of_range_gain_is_rejected() {
+        let err = parse_settings(r#"{ "input_gain": -3.0 }"#).expect_err("отрицательное усиление");
+        assert!(err.contains("input_gain"), "ошибка: {err}");
+        assert!(parse_settings(r#"{ "input_gain": 2.5 }"#).is_ok());
     }
 
     /// Синтаксически битый JSON тоже даёт понятную ошибку.

@@ -69,16 +69,20 @@ fn build_icon(recording: bool) -> Icon {
     Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE).expect("иконка трея имеет валидный размер")
 }
 
-/// Создаёт иконку в системном трее с текущим состоянием записи и меню.
-pub fn create_tray(recording: bool) -> Result<TrayIcon, String> {
-    let menu = build_menu()?;
-    let tooltip = if recording {
+/// Подсказка при наведении на иконку.
+fn tooltip(recording: bool) -> &'static str {
+    if recording {
         "VoiceAI — идёт запись"
     } else {
         "VoiceAI — готов к записи"
-    };
+    }
+}
+
+/// Создаёт иконку в системном трее с текущим состоянием записи и меню.
+pub fn create_tray(recording: bool) -> Result<TrayIcon, String> {
+    let menu = build_menu()?;
     TrayIconBuilder::new()
-        .with_tooltip(tooltip)
+        .with_tooltip(tooltip(recording))
         .with_icon(build_icon(recording))
         .with_menu(Box::new(menu))
         .build()
@@ -87,13 +91,8 @@ pub fn create_tray(recording: bool) -> Result<TrayIcon, String> {
 
 /// Обновляет вид и подсказку иконки под текущее состояние записи.
 pub fn update_tray(tray: &TrayIcon, recording: bool) {
-    let tooltip = if recording {
-        "VoiceAI — идёт запись"
-    } else {
-        "VoiceAI — готов к записи"
-    };
     let _ = tray.set_icon(Some(build_icon(recording)));
-    let _ = tray.set_tooltip(Some(tooltip));
+    let _ = tray.set_tooltip(Some(tooltip(recording)));
 }
 
 #[cfg(test)]

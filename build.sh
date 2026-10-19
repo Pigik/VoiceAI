@@ -3,19 +3,20 @@
 #
 # Требования:
 #   - Rust (rustup) — версия зафиксирована в rust-toolchain.toml
-#   - C/C++ компилятор (на macOS — Xcode Command Line Tools, входит в Xcode)
+#   - C/C++ компилятор (на macOS — Xcode Command Line Tools)
 #   - CMake
-#   - Clang/LLVM (нужна библиотека libclang для bindgen):
-#       Ubuntu: sudo apt-get install -y clang libclang-dev cmake
-#   - macOS: распознавание идёт через Metal (GPU любого Mac).
-#     Ubuntu: распознавание идёт на процессоре (GPU-ускорение на Linux не требуется).
+#   - Clang/LLVM (библиотека libclang для bindgen):
+#       Ubuntu: sudo apt-get install -y build-essential cmake clang libclang-dev libasound2-dev
+#
+# macOS: распознавание идёт через Metal (GPU любого Mac).
+# Linux: распознавание идёт на процессоре.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 cargo build --release
 
 OUT="target/release"
-# Кладём модель рядом с бинарником — main.rs ищет модель в папке с программой.
+# Кладём модель рядом с бинарником — программа ищет её в своей папке.
 if [ -f "ggml-large-v3-turbo.bin" ]; then
     cp "ggml-large-v3-turbo.bin" "$OUT/"
 fi

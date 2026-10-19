@@ -1,9 +1,5 @@
+# Версия Rust, на которой проект собирается и проверяется (локально и в CI).
+# rustup сам скачает её при первой сборке.
 [toolchain]
 channel = "1.95.0"
-targets = [
-    "x86_64-pc-windows-msvc",
-    "x86_64-unknown-linux-gnu",
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-]
 components = ["clippy", "rustfmt"]

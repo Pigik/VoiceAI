@@ -17,8 +17,22 @@ const SINC_TAPS: f64 = 16.0;
 /// боковые лепестки фильтра (меньше «звона» и алиасинга на краях полосы).
 const KAISER_BETA: f64 = 7.0;
 
+/// Длина окна анализа: 20 мс при 16 кГц.
+const WINDOW: usize = 320;
+
+/// Ниже этого RMS (по окну) запись считается тишиной.
+const SILENCE_RMS: f32 = 0.002;
+
 fn i16_to_f32(sample: i16) -> f32 {
-    sample as f32 / i16::MAX as f32
+    sample as f32 / 32768.0
+}
+
+/// RMS каждого полного окна `WINDOW` (хвост короче окна не учитывается).
+fn window_rms(audio: &[f32]) -> Vec<f32> {
+    audio
+        .chunks_exact(WINDOW)
+        .map(|seg| (seg.iter().map(|x| x * x).sum::<f32>() / WINDOW as f32).sqrt())
+        .collect()
 }
 
 /// Нормированный sinc (ядро идеального низкочастотного фильтра).
@@ -107,40 +121,30 @@ fn resample_sinc(src: &[f32], from: f64, to: f64) -> Vec<f32> {
 /// Обрезает молчание в начале и в конце записи.
 ///
 /// Порог — относительный (5% от самого громкого окна), поэтому не зависит
-/// от уровня микрофона и не «вырезает» тихую речь. Порог снизу ограничен
-/// мягкой абсолютной величиной (-48 дБ), а по бокам оставляется небольшой
-/// запас, чтобы не «срезать» мягкие окончания слов (последний слог «дела»
-/// тише, чем гласные середины, но это ещё речь). Если запись почти
+/// от уровня микрофона и не «вырезает» тихую речь. Сверху порог ограничен
+/// абсолютной величиной (-48 дБ), чтобы на громких записях не срезать тихие
+/// окончания слов (последний слог «дела» тише гласных середины, но это ещё
+/// речь); по бокам оставляется запас в одно окно. Если запись почти
 /// полностью состоит из тишины или речь занимает меньше пятой части —
 /// ничего не обрезаем, чтобы не испортить короткий клип.
 pub fn trim_silence(audio: &[f32]) -> &[f32] {
-    const WINDOW: usize = 320; // 20 мс при 16 кГц
     const MIN_SPEECH_FRACTION: usize = 5; // речь должна занимать >= 1/5 клипа
     // Запас по одному окну (20 мс) с каждой стороны границы речи: эти окна
     // почти наверняка содержат хвост последней гласной или призвук начала.
     const EDGE_PAD_WINDOWS: usize = 1;
 
-    let windows = audio.len() / WINDOW;
+    let rms = window_rms(audio);
+    let windows = rms.len();
     if windows < 4 {
         return audio;
     }
 
-    // RMS каждого окна.
-    let mut rms: Vec<f32> = Vec::with_capacity(windows);
-    for w in 0..windows {
-        let seg = &audio[w * WINDOW..(w + 1) * WINDOW];
-        let sum: f32 = seg.iter().map(|x| x * x).sum();
-        rms.push((sum / WINDOW as f32).sqrt());
-    }
-
     let max_rms = rms.iter().fold(0.0f32, |acc, &x| acc.max(x));
     // Почти всё тишина (микрофон не пишет) — не трогаем запись.
-    if max_rms < 0.002 {
+    if max_rms < SILENCE_RMS {
         return audio;
     }
 
-    // Абсолютный потолок порога — -48 дБ (вместо прежних -42 дБ): не режем
-    // тихие, но ещё слышимые окончания слов на громких записях.
     let threshold = (max_rms * 0.05).min(0.004);
     let mut start = 0;
     while start < windows && rms[start] < threshold {
@@ -164,39 +168,63 @@ pub fn trim_silence(audio: &[f32]) -> &[f32] {
 
 /// Подавляет фоновый шум в записи (мягкое шумоподавление).
 ///
-/// Сначала убирает постоянную составляющую и низкочастотный гул простым
-/// высокочастотным фильтром первого порядка, затем применяет мягкий шумовой
-/// порог: тихие участки, не превосходящие уровень шума, дополнительно
-/// приглушаются, а речь остаётся почти нетронутой. Работает слабее речевых
-/// DSP (не «вырезает» речь), но заметно чистит фон на тихих записях.
+/// 1. Фильтр высоких частот первого порядка (срез ~100 Гц) убирает
+///    постоянную составляющую и низкочастотный гул, не задевая голос.
+/// 2. Шумовой гейт по окнам 20 мс: уровень шума оценивается по самым тихим
+///    окнам, а окна тише порога приглушаются. Усиление между окнами
+///    плавно интерполируется, поэтому на границах не появляется щелчков,
+///    а сама речь (громче порога) не искажается.
 pub fn apply_noise_reduction(audio: &mut [f32]) {
     if audio.is_empty() {
         return;
     }
 
-    // Высокочастотный фильтр первого порядка (срезает гул и DC).
-    let alpha = 0.2f32;
-    let mut prev = 0.0f32;
+    // alpha = 1 - exp(-2π·100/16000): частота среза ~100 Гц при 16 кГц.
+    const HIGH_PASS_ALPHA: f32 = 0.0385;
+    let mut low = 0.0f32;
     for sample in audio.iter_mut() {
-        let hp = *sample - prev;
-        prev += alpha * hp;
-        *sample = hp;
+        low += HIGH_PASS_ALPHA * (*sample - low);
+        *sample -= low;
     }
 
-    // Оценка уровня шума: RMS самых тихих 25% сэмплов.
-    let mut sorted: Vec<f32> = audio.iter().map(|x| x.abs()).collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let noise_count = (sorted.len() / 4).max(1);
-    let noise_sum: f32 = sorted.iter().take(noise_count).map(|x| x * x).sum();
-    let noise_floor = (noise_sum / noise_count as f32).sqrt();
-    let gate = (noise_floor * 3.0).max(0.001); // порог: в 3 раза выше уровня шума
+    // Уровень по окнам (последнее неполное окно тоже учитываем).
+    let rms: Vec<f32> = audio
+        .chunks(WINDOW)
+        .map(|seg| (seg.iter().map(|x| x * x).sum::<f32>() / seg.len() as f32).sqrt())
+        .collect();
 
-    // Мягкое приглушение тихих участков без резкой обрезки речи.
-    for sample in audio.iter_mut() {
-        let abs = sample.abs();
-        if abs < gate {
-            *sample *= (abs / gate) * 0.3;
-        }
+    // Уровень шума — 25-й перцентиль RMS окон; порог в 3 раза выше.
+    let mut sorted = rms.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let noise_floor = sorted[sorted.len() / 4];
+    let gate = (noise_floor * 3.0).max(0.001);
+
+    // Окна тише порога приглушаются тем сильнее, чем они тише (до MIN_GAIN).
+    const MIN_GAIN: f32 = 0.1;
+    let gains: Vec<f32> = rms
+        .iter()
+        .map(|&level| {
+            if level >= gate {
+                1.0
+            } else {
+                let ratio = level / gate;
+                MIN_GAIN + (1.0 - MIN_GAIN) * ratio * ratio
+            }
+        })
+        .collect();
+
+    // Плавная интерполяция усиления между центрами соседних окон.
+    let last = gains.len() - 1;
+    for (i, sample) in audio.iter_mut().enumerate() {
+        let pos = i as f32 / WINDOW as f32 - 0.5;
+        let k0 = if pos <= 0.0 {
+            0
+        } else {
+            (pos.floor() as usize).min(last)
+        };
+        let k1 = (k0 + 1).min(last);
+        let frac = (pos - k0 as f32).clamp(0.0, 1.0);
+        *sample *= gains[k0] * (1.0 - frac) + gains[k1] * frac;
     }
 }
 
@@ -240,36 +268,23 @@ pub fn normalize_audio(audio: &mut [f32]) {
 /// Есть ли в записи заметная энергия/речь?
 ///
 /// Тихие и «пустые» записи (быстрое нажатие клавиши, фоновый шум, глубокий
-/// молчание) не содержат речи, но Whisper на них умеет «галлюцинировать»
+/// тишина) не содержат речи, но Whisper на них умеет «галлюцинировать»
 /// (например, «Продолжение следует»). Эта функция помогает отличить
 /// реальную речь от тишины: если максимум по окнам RMS ниже порога —
 /// речь не считаем распознанной.
 pub fn has_speech_energy(audio: &[f32]) -> bool {
-    const WINDOW: usize = 320; // 20 мс при 16 кГц
-
     if audio.is_empty() {
         return false;
     }
 
-    let windows = audio.len() / WINDOW;
-    if windows == 0 {
+    if audio.len() < WINDOW {
         // Слишком короткий клип — оцениваем по всему буферу целиком.
         let sum: f32 = audio.iter().map(|x| x * x).sum();
-        return (sum / audio.len() as f32).sqrt() >= 0.002;
-    }
-
-    let mut max_rms = 0.0f32;
-    for w in 0..windows {
-        let seg = &audio[w * WINDOW..(w + 1) * WINDOW];
-        let sum: f32 = seg.iter().map(|x| x * x).sum();
-        let rms = (sum / WINDOW as f32).sqrt();
-        if rms > max_rms {
-            max_rms = rms;
-        }
+        return (sum / audio.len() as f32).sqrt() >= SILENCE_RMS;
     }
 
     // Как и в trim_silence: ниже этого RMS считаем запись «тишиной».
-    max_rms >= 0.002
+    window_rms(audio).into_iter().any(|rms| rms >= SILENCE_RMS)
 }
 
 #[cfg(test)]
@@ -282,7 +297,7 @@ mod tests {
         let out = resample_to_whisper(&input, 16000);
         assert_eq!(out.len(), input.len());
         assert_eq!(out[0], 0.0);
-        assert!((out[1] - 1000.0 / i16::MAX as f32).abs() < 1e-6);
+        assert!((out[1] - 1000.0 / 32768.0).abs() < 1e-6);
     }
 
     #[test]
@@ -327,24 +342,47 @@ mod tests {
         assert!(audio.iter().all(|&x| x == 0.0));
     }
 
+    /// Синусоида заданной частоты и амплитуды (16 кГц).
+    fn sine(freq: f32, amplitude: f32, len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| amplitude * (2.0 * std::f32::consts::PI * freq * i as f32 / 16_000.0).sin())
+            .collect()
+    }
+
+    fn energy(audio: &[f32]) -> f32 {
+        audio.iter().map(|x| x * x).sum()
+    }
+
     #[test]
     fn noise_reduction_lowers_quiet_section() {
-        let mut audio: Vec<f32> = Vec::new();
-        // Тихий фон (шум) в начале.
-        audio.extend(std::iter::repeat_n(0.01, 800));
-        // Громкая «речь» в середине.
-        audio.extend(std::iter::repeat_n(0.5, 800));
-        let quiet_before: f32 = audio[..800].iter().map(|x| x.abs()).sum();
+        // Тихий фон — громкая «речь» — снова тихий фон, по 0.2 с.
+        let noise = sine(1000.0, 0.01, 3200);
+        let speech = sine(300.0, 0.5, 3200);
+        let mut audio = [noise.clone(), speech.clone(), noise.clone()].concat();
         apply_noise_reduction(&mut audio);
-        let quiet_after: f32 = audio[..800].iter().map(|x| x.abs()).sum();
-        let speech_before: f32 = audio[800..].iter().map(|x| x.abs()).sum();
-        let speech_after: f32 = audio[800..].iter().map(|x| x.abs()).sum();
-        // Тихий участок заметно обрезан, а «речь» почти не тронута.
-        assert!(quiet_after < quiet_before * 0.5, "шум должен снизиться");
+
+        // Окно сразу за речью не учитываем: там затухает «хвост» фильтра.
+        let noise_after = energy(&audio[..2880]) + energy(&audio[6720..]);
+        let noise_before = energy(&noise[..2880]) + energy(&noise[320..]);
+        let speech_after = energy(&audio[3200..6400]);
         assert!(
-            speech_after > speech_before * 0.5,
+            noise_after < noise_before * 0.5,
+            "шум должен заметно снизиться"
+        );
+        assert!(
+            speech_after > energy(&speech) * 0.8,
             "речь должна сохраниться"
         );
+    }
+
+    #[test]
+    fn noise_reduction_removes_dc_offset() {
+        // Постоянное смещение (DC) — не звук, фильтр должен его убрать.
+        let mut audio: Vec<f32> = sine(300.0, 0.3, 6400).iter().map(|x| x + 0.2).collect();
+        apply_noise_reduction(&mut audio);
+        let tail = &audio[3200..];
+        let mean = tail.iter().sum::<f32>() / tail.len() as f32;
+        assert!(mean.abs() < 0.01, "среднее после фильтра: {mean}");
     }
 
     #[test]

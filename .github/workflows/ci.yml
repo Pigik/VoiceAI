@@ -10,7 +10,7 @@ concurrency:
 
 env:
   RUST_BACKTRACE: 1
-  # Версия из rust-toolchain.toml; для явности дублируем в шагах.
+  # Должна совпадать с rust-toolchain.toml.
   TOOLCHAIN: "1.95.0"
 
 jobs:
@@ -32,7 +32,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   # Статический анализ и тесты (кроме Windows: там whisper-rs собирается
-  # с CUDA и требует локальный CUDA Toolkit — см. build.bat).
+  # с CUDA и требует CUDA Toolkit — проверяйте локально через check.ps1).
   lint-and-test:
     name: lint+test (${{ matrix.os }})
     strategy:
@@ -55,9 +55,6 @@ jobs:
         run: |
           rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --component rustfmt,clippy
           rustup default ${{ env.TOOLCHAIN }}
-
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
 
       - name: cargo clippy -- -D warnings
         run: cargo clippy --all-targets -- -D warnings

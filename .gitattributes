@@ -1,0 +1,10 @@
+# Единые переводы строк в репозитории независимо от настроек git у автора.
+* text=auto
+
+# Скрипты Windows должны быть с CRLF: cmd.exe с LF-файлами ошибается при
+# поиске меток (call :label) и в длинных блоках if (...).
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Shell-скрипты — только LF, иначе bash на Linux/macOS падает на «\r».
+*.sh text eol=lf

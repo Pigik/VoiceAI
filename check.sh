@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Локальный чекер VoiceAI: формат + clippy + тесты одной командой (T-15, T-16).
+# Локальная проверка VoiceAI одной командой: формат + clippy + тесты.
+# Те же шаги выполняет CI (.github/workflows/ci.yml).
 #
 # Использование (Linux / macOS):
-#     ./check.sh
+#     bash check.sh
 #
 # Завершается кодом 0, только если все три шага прошли.
 set -u
+cd "$(dirname "$0")"
 
 failed=0
 
@@ -14,6 +16,7 @@ step() {
     echo "== $1 =="
 }
 
+step "1/3. Форматирование (cargo fmt --check)"
 if ! cargo fmt --all -- --check; then failed=1; fi
 
 step "2/3. Статический анализ (cargo clippy -D warnings)"

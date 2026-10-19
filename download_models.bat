@@ -1,12 +1,13 @@
 @echo off
-rem Downloads Whisper models and checks their SHA-256.
+rem Downloads the Whisper model and checks its SHA-256.
 rem
 rem If the file is already downloaded and the checksum matches, the download
 rem is skipped (cache is reused). A corrupted file is re-downloaded.
 rem
-rem Primary source is the project's own GitHub Release: such a link never
-rem expires while the repo lives. HuggingFace remains the fallback source
-rem only for the "zeroth" release, before the model exists in the Release.
+rem Source: by default HuggingFace (ggerganov/whisper.cpp). A different base
+rem URL can be passed as the first argument, e.g. the project's own GitHub
+rem Release - release.yml does exactly that and falls back to HuggingFace
+rem when the release does not contain the model yet.
 rem
 rem IMPORTANT: keep this script ASCII-only. cmd.exe on GitHub runners and on
 rem Russian Windows decodes UTF-8 bytes according to the console codepage,
@@ -40,9 +41,9 @@ if /i "%HASH%"=="%EXPECTED%" (
     echo Already present: %FILE% - checksum matches, skipping.
     exit /b 0
 )
-rem NOTE: keep echo lines outside-if-parens structures label-free: a "(" or
-rem ")" inside an echo that lives inside an if (...) block makes cmd treat
-rem the text as a nested group and fail parsing with 'unexpected at this time'.
+rem NOTE: do not put "(" or ")" inside echo lines that live in an if (...)
+rem block: cmd treats them as a nested group and fails parsing with
+rem '... was unexpected at this time'.
 echo File %FILE% is corrupted, SHA-256 mismatch - downloading again.
 del /q "%FILE%"
 

@@ -1,8 +1,12 @@
 //! Автозапуск приложения при входе пользователя в систему.
 //!
 //! Windows: запись в реестре `HKCU\...\Run`. Linux: файл `voiceai.desktop`
-//! в `~/.config/autostart`. macOS: LaunchAgent-плейлист в
+//! в `~/.config/autostart`. macOS: LaunchAgent (plist-файл) в
 //! `~/Library/LaunchAgents`. Включается настройкой `auto_start`.
+//!
+//! При автозапуске рабочая папка процесса может быть недоступна для записи
+//! (например, `C:\Windows\System32`) — это учитывает `main.rs`, переходя
+//! в папку программы.
 
 #[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
@@ -84,8 +88,10 @@ fn xdg_autostart(enabled: bool) -> Result<String, String> {
     }
 
     let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    // Путь в кавычках: в нём могут быть пробелы (спецификация Desktop Entry).
     let content = format!(
-        "[Desktop Entry]\nType=Application\nName=VoiceAI\nExec={}\nComment=Диктофон с распознаванием речи\n",
+        "[Desktop Entry]\nType=Application\nName=VoiceAI\nExec=\"{}\"\n\
+         Comment=Диктофон с распознаванием речи\n",
         exe.to_string_lossy()
     );
     std::fs::create_dir_all(file.parent().ok_or("Нет папки для автозапуска")?)

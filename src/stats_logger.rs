@@ -1,28 +1,41 @@
+//! Журнал реплик (`replicas.jsonl`): одна запись = одна расшифровка.
+//!
+//! Формат — JSON Lines: по одному JSON-объекту на строку. Журнал хранится
+//! в папке данных приложения и ограничен `MAX_REPLICAS` последними записями.
+
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use uuid::Uuid;
 
+/// Одна запись журнала.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ReplicaLog {
-    pub id: Uuid,                   // T-13: Уникальный ID
-    pub timestamp: DateTime<Local>, // T-12: Время и часовой пояс
-    pub app_name: String,           // T-06: Приложение-цель
-    pub duration_ms: u64,           // T-05: Задержка/длительность
-    pub word_count: usize,          // T-04: Счетчик слов
-    pub text: Option<String>,       // T-10: Текст (None в режиме приватности)
-    pub wpm: f64,                   // Скорость диктовки
+    /// Уникальный идентификатор записи.
+    pub id: Uuid,
+    /// Время записи с часовым поясом.
+    pub timestamp: DateTime<Local>,
+    /// Заголовок окна, куда вставлялся текст.
+    pub app_name: String,
+    /// Длительность записи, мс.
+    pub duration_ms: u64,
+    /// Число слов в распознанном тексте.
+    pub word_count: usize,
+    /// Распознанный текст (`None` в режиме приватности или если речи не было).
+    pub text: Option<String>,
 }
 
-const MAX_REPLICAS: usize = 200; // T-11
+/// Сколько последних записей хранится в журнале (на диске и в памяти).
+pub const MAX_REPLICAS: usize = 200;
 
+/// Дописывает запись в журнал и обрезает его до `MAX_REPLICAS` записей.
+/// В режиме приватности текст записи не сохраняется.
 pub fn log_replica(log_path: &std::path::Path, mut entry: ReplicaLog, privacy_mode: bool) {
     if privacy_mode {
         entry.text = None;
     }
 
-    // T-01: Сериализация в одну строку
     let Ok(json_line) = serde_json::to_string(&entry) else {
         return;
     };
@@ -33,7 +46,6 @@ pub fn log_replica(log_path: &std::path::Path, mut entry: ReplicaLog, privacy_mo
         let _ = file.write_all(json_line.as_bytes());
     }
 
-    // Ротация (Очистка до MAX_REPLICAS)
     enforce_log_limit(log_path);
 }
 
@@ -50,7 +62,7 @@ pub fn read_replicas(path: &std::path::Path) -> Vec<ReplicaLog> {
         .collect()
 }
 
-// Временная сложность: O(N), Пространственная сложность: O(N), где N = 200.
+/// Оставляет в файле журнала только последние `MAX_REPLICAS` строк.
 fn enforce_log_limit(path: &std::path::Path) {
     let Ok(file) = std::fs::File::open(path) else {
         return;
@@ -101,7 +113,6 @@ mod tests {
             duration_ms: 1200,
             word_count: 5,
             text: Some("привет мир".to_string()),
-            wpm: 250.0,
         };
         log_replica(&path, entry.clone(), false);
         let read = read_replicas(&path);
@@ -124,7 +135,6 @@ mod tests {
             duration_ms: 1000,
             word_count: 3,
             text: Some("секретный текст".to_string()),
-            wpm: 180.0,
         };
         log_replica(&path, entry, true);
         let read = read_replicas(&path);
@@ -147,7 +157,6 @@ mod tests {
             duration_ms: 1000,
             word_count: words,
             text: Some(text.to_string()),
-            wpm: 180.0,
         };
         let a = make(1, "один");
         let b = make(2, "два");

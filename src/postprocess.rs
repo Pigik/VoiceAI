@@ -1,57 +1,56 @@
 //! Пост-обработка распознанного текста.
 //!
-//! Whisper отдаёт «сырой» текст: со словами-паразитами, повторяющимися
+//! Модель отдаёт «сырой» текст: со словами-паразитами, повторяющимися
 //! словами, без единообразной пунктуации и заглавных букв. Этот модуль
 //! приводит его к аккуратному виду целиком локально (без интернета и LLM):
 //!
-//! 1. Убирает слова-паразиты и звуки-мычания («ну», «вот», «как бы», «э-э»).
-//! 2. Убирает случайные повторы слов («очень очень» -> «очень»).
-//! 3. Нормализует пунктуацию (пробелы, повторяющиеся знаки, заглавные буквы
-//!    в начале предложений, точка в конце).
-//! 4. Делит длинный текст на абзацы.
+//! 1. Заменяет слово «тире» на знак «—», речевые дроби («три пятых» → «3/5»)
+//!    и время («пятнадцать тридцать четыре» → «15:34»).
+//! 2. Убирает слова-паразиты и звуки-мычания («ну», «вот», «э-э»).
+//! 3. Убирает случайные повторы слов («очень очень» → «очень»).
+//! 4. Нормализует пунктуацию: пробелы, повторяющиеся знаки, заглавные буквы
+//!    в начале предложений, точка в конце.
+//! 5. Делит длинный текст на абзацы.
 
-/// Одиночные слова-паразиты. Подобраны так, чтобы удаление не искажало
-/// смысл: это классические разговорные «пустышки» без собственного значения.
-const FILLER_WORDS: &[&str] = &[
-    "ну",
-    "вот",
-    "типа",
-    "какбы",
-    "знаешь",
-    "короче",
-    "прикинь",
-    "блин",
-    "слушай",
-    "слушайте",
-];
+/// Одиночные слова-паразиты. Сюда попадают только слова, удаление которых
+/// не искажает смысл: многозначные слова («знаешь», «слушай», «короче»)
+/// сюда не входят — «ты знаешь ответ» не должно превращаться в «ты ответ».
+const FILLER_WORDS: &[&str] = &["ну", "вот", "типа", "какбы", "блин"];
 
-/// Многословные паразитические обороты (ищутся целиком, длинные — раньше).
+/// Многословные паразитические обороты, которые удаляются всегда.
 const FILLER_PHRASES: &[&str] = &[
     "ну вот",
     "ну и вот",
-    "это самое",
     "как бы это",
     "ну типа",
     "так сказать",
     "в общем то",
+    "в общем-то",
     "короче говоря",
-    "как бы",
-    "в общем",
-    "так вот",
     "скажем так",
 ];
 
+/// Обороты, которые бывают и паразитами, и полноценной частью фразы
+/// («в общем случае», «как бы ты поступил», «это самое важное»). Их удаляем,
+/// только когда они выделены запятой как вводные: «В общем, всё готово».
+const COMMA_FILLER_PHRASES: &[&str] = &["в общем", "как бы", "это самое", "так вот"];
+
 /// Отдельные звуки-мычания и междометия, не несущие смысла.
+///
+/// Однобуквенные «а», «о», «у» сюда не входят: это союз и предлоги
+/// («а он остался», «думаю о тебе», «у меня»).
 const SOUND_WORDS: &[&str] = &[
-    "э", "ээ", "э-э", "а", "аа", "а-а", "уу", "у-у", "м", "мм", "м-м", "хм", "угу", "ага", "о",
-    "оо",
+    "э", "ээ", "э-э", "аа", "а-а", "уу", "у-у", "м", "мм", "м-м", "хм", "угу", "ага", "оо",
 ];
 
-/// Верхняя граница «длины» абзаца в символах, после которой начинается новый.
+/// Примерная длина абзаца в символах, после которой начинается новый.
 const PARAGRAPH_CHARS: usize = 360;
 
-/// Словарь числителительных: слово -> цифра (0..19).
-const ONES_TWENTIES: &[(&str, u32)] = &[
+/// Короткий последний абзац (меньше стольких символов) приклеивается к предыдущему.
+const MIN_LAST_PARAGRAPH_CHARS: usize = 40;
+
+/// Числительные от 0 до 19: слово -> число.
+const ONES_AND_TEENS: &[(&str, u32)] = &[
     ("ноль", 0),
     ("нуль", 0),
     ("один", 1),
@@ -90,44 +89,41 @@ const TENS: &[(&str, u32)] = &[
     ("девяносто", 90),
 ];
 
-/// Знаменатели дробей: «пятых» -> 5, «десятых» -> 10 и т.д.
-const DENOMINATORS: &[(&str, u32)] = &[
+/// Знаменатели дробей в той форме, в которой их произносят после
+/// числителя «одна» (женский род, ед. ч.: «одна пятая»).
+const DENOMINATORS_SINGULAR: &[(&str, u32)] = &[
     ("вторая", 2),
-    ("вторых", 2),
-    ("второе", 2),
     ("третья", 3),
-    ("третьих", 3),
-    ("третье", 3),
     ("четвёртая", 4),
     ("четвертая", 4),
+    ("пятая", 5),
+    ("шестая", 6),
+    ("седьмая", 7),
+    ("восьмая", 8),
+    ("девятая", 9),
+    ("десятая", 10),
+    ("двенадцатая", 12),
+    ("двадцатая", 20),
+];
+
+/// Знаменатели дробей после остальных числителей (родительный падеж мн. ч.:
+/// «три пятых»).
+///
+/// Порядковые числительные в других формах («двадцать пятое мая»,
+/// «двадцать вторая неделя») дробями не считаются.
+const DENOMINATORS_PLURAL: &[(&str, u32)] = &[
+    ("вторых", 2),
+    ("третьих", 3),
     ("четвёртых", 4),
     ("четвертых", 4),
-    ("четвёртое", 4),
-    ("четвертое", 4),
-    ("пятая", 5),
     ("пятых", 5),
-    ("пятое", 5),
-    ("шестая", 6),
     ("шестых", 6),
-    ("шестое", 6),
-    ("седьмая", 7),
     ("седьмых", 7),
-    ("седьмое", 7),
-    ("восьмая", 8),
     ("восьмых", 8),
-    ("восьмое", 8),
-    ("девятая", 9),
     ("девятых", 9),
-    ("девятое", 9),
-    ("десятая", 10),
     ("десятых", 10),
-    ("десятое", 10),
-    ("двенадцатая", 12),
     ("двенадцатых", 12),
-    ("двенадцатое", 12),
-    ("двадцатая", 20),
     ("двадцатых", 20),
-    ("двадцатое", 20),
 ];
 
 /// Сигналы, что перед нами время, а не число: слова «час», «часа», «часов».
@@ -140,62 +136,46 @@ fn is_minute_word(word: &str) -> bool {
     matches!(word, "минута" | "минуты" | "минут")
 }
 
-/// Парсит русское числительное (одно слово) в число. Возвращает None, если слово не является числом.
+/// Парсит русское числительное (одно слово) в число.
 fn parse_number_word(word: &str) -> Option<u32> {
     let low = lowercase_word(word);
-    for &(name, val) in ONES_TWENTIES {
-        if low == name {
-            return Some(val);
-        }
-    }
-    for &(name, val) in TENS {
-        if low == name {
-            return Some(val);
-        }
-    }
-    None
+    ONES_AND_TEENS
+        .iter()
+        .chain(TENS)
+        .find(|(name, _)| *name == low)
+        .map(|&(_, value)| value)
 }
 
-/// Парсит составное числительное из нескольких слов (до 3): «триста двадцать один» -> 321.
+/// Парсит числитель дроби из одного-двух слов: «три» -> 3,
+/// «двадцать одна» -> 21. Другие сочетания («три два») — не число.
 fn parse_compound_number(words: &[&str]) -> Option<u32> {
-    let mut total: u32 = 0;
-    let mut current: u32 = 0;
-    for w in words {
-        if let Some(v) = parse_number_word(w) {
-            if v >= 100 {
-                if current == 0 {
-                    current = v;
-                } else {
-                    current *= v;
-                }
-            } else if v >= 10 {
-                if current == 0 {
-                    current = v;
-                } else {
-                    current += v;
-                }
-            } else {
-                current += v;
-            }
-        } else {
-            return None;
+    match words {
+        [single] => parse_number_word(single),
+        [tens, ones] => {
+            let tens = parse_number_word(tens)?;
+            let ones = parse_number_word(ones)?;
+            (tens >= 20 && tens % 10 == 0 && (1..=9).contains(&ones)).then_some(tens + ones)
         }
+        _ => None,
     }
-    total = if current > 0 { current } else { total };
-    if total > 0 { Some(total) } else { None }
 }
 
-/// Заменяет слово «тире» на символ «-» в токенах.
+/// Нужен ли после числителя знаменатель в единственном числе
+/// («одна пятая», «двадцать одна пятая»), а не во множественном («две пятых»).
+fn takes_singular_denominator(numerator: u32) -> bool {
+    numerator % 10 == 1 && numerator % 100 != 11
+}
+
+/// Заменяет слово «тире» на знак тире.
 fn replace_dash_word(tokens: &[String]) -> Vec<String> {
     tokens
         .iter()
-        .map(|t| {
-            let stripped = strip_trailing_punct(t);
-            let low = lowercase_word(stripped);
-            if low == "тире" {
-                "-".to_string()
+        .map(|token| {
+            let stripped = strip_trailing_punct(token);
+            if lowercase_word(stripped) == "тире" {
+                format!("\u{2014}{}", trailing_punct(token))
             } else {
-                t.clone()
+                token.clone()
             }
         })
         .collect()
@@ -207,29 +187,33 @@ fn replace_fractions(tokens: &[String]) -> Vec<String> {
     let mut result: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
     while i < tokens.len() {
-        // Ищем конструкцию: <числительное> <знаменатель>
-        // Числительное может быть составным: «триста двадцать одна пятая».
-        // Пока берём простой случай: 1-2 слова числительного + 1 слово знаменателя.
+        // Числитель — одно-два слова-числа подряд без знаков препинания
+        // между ними (иначе это уже разные части фразы).
         let mut num_words: Vec<&str> = Vec::new();
         let mut j = i;
-        while j < tokens.len() {
-            let s = strip_trailing_punct(&tokens[j]);
-            let l = lowercase_word(s);
-            if parse_number_word(&l).is_some() {
-                num_words.push(s);
-                j += 1;
-            } else {
+        while j < tokens.len() && num_words.len() < 2 {
+            let token = &tokens[j];
+            if !trailing_punct(token).is_empty() || parse_number_word(token).is_none() {
                 break;
             }
+            num_words.push(token.as_str());
+            j += 1;
         }
 
-        if j < tokens.len() && !num_words.is_empty() {
-            let denom_stripped = strip_trailing_punct(&tokens[j]);
-            let denom_low = lowercase_word(denom_stripped);
-            if let Some(&(_, denom_val)) = DENOMINATORS.iter().find(|&&(name, _)| denom_low == name)
-                && let Some(num_val) = parse_compound_number(&num_words)
-            {
-                result.push(format!("{num_val}/{denom_val}"));
+        if j < tokens.len()
+            && let Some(numerator) = parse_compound_number(&num_words)
+        {
+            let denom_low = lowercase_word(strip_trailing_punct(&tokens[j]));
+            let table = if takes_singular_denominator(numerator) {
+                DENOMINATORS_SINGULAR
+            } else {
+                DENOMINATORS_PLURAL
+            };
+            if let Some(&(_, denominator)) = table.iter().find(|(name, _)| *name == denom_low) {
+                result.push(format!(
+                    "{numerator}/{denominator}{}",
+                    trailing_punct(&tokens[j])
+                ));
                 i = j + 1;
                 continue;
             }
@@ -264,70 +248,75 @@ fn compound_from_parts(parts: &[u32]) -> Option<u32> {
     Some(total)
 }
 
-/// Заменяет речевое время на формат HH:MM.
+/// Заменяет речевое время на формат ЧЧ:ММ.
 ///
 /// Конвертация происходит только при явном признаке времени, чтобы не
 /// искажать диктуемые числа и номера:
 ///   «пятнадцать тридцать четыре» -> «15:34»
 ///   «15 34» -> «15:34»
-///   «час тридцать» -> «1:30»
-///   «три часа сорок пять» -> «3:45»
+///   «час тридцать» -> «01:30»
+///   «три часа сорок пять» -> «03:45»
 ///   «двенадцать ноль ноль» -> «12:00»
-/// Слово «двадцать три» как число при этом не превращается во «20:03».
+///
+/// Число «двадцать три» при этом не превращается в «20:03», а слова,
+/// разделённые знаком препинания, не склеиваются в одно время.
 fn replace_time_expressions(tokens: &[String]) -> Vec<String> {
     let mut result: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
     while i < tokens.len() {
-        let stripped = strip_trailing_punct(&tokens[i]);
-        let low = lowercase_word(stripped);
+        let token = &tokens[i];
+        let low = lowercase_word(token);
 
-        // Час: слово «час»/«часа»/«часов» (=1) либо число. Токен с пунктуацией
-        // час не кандидат («один.» после точки — конец предложения).
+        // Кандидат в часы — слово «час» (= 1), число цифрами или словом.
+        // Токен со знаком препинания («один.») — конец фразы, а не время.
         let mut hour_val: Option<u32> = None;
         let mut strong = false;
-        if is_hour_word(&low) {
-            hour_val = Some(1);
-            strong = true;
-        } else if tokens[i] == stripped
-            && low.chars().all(|c| c.is_ascii_digit() || c == ':')
-            && let Ok(v) = low.parse::<u32>()
-            && v <= 23
-        {
-            hour_val = Some(v);
-            strong = true;
-        } else if let Some(v) = parse_number_word(&low)
-            && v <= 23
-        {
-            hour_val = Some(v);
+        if trailing_punct(token).is_empty() {
+            if is_hour_word(&low) {
+                hour_val = Some(1);
+                strong = true;
+            } else if !low.is_empty()
+                && low.chars().all(|c| c.is_ascii_digit())
+                && let Ok(v) = low.parse::<u32>()
+                && v <= 23
+            {
+                hour_val = Some(v);
+                strong = true;
+            } else if let Some(v) = parse_number_word(&low)
+                && v <= 23
+            {
+                hour_val = Some(v);
+            }
         }
 
         if let Some(h) = hour_val {
             let mut j = i + 1;
+            let mut stopped_by_punct = false;
             // Пропускаем слова «час»/«часа»/«часов» — верный признак времени.
             while j < tokens.len()
+                && !stopped_by_punct
                 && is_hour_word(&lowercase_word(strip_trailing_punct(&tokens[j])))
             {
                 strong = true;
+                stopped_by_punct = !trailing_punct(&tokens[j]).is_empty();
                 j += 1;
             }
 
-            // Собираем число минут (до 3 токенов), игнорируя слова «минут...».
+            // Собираем число минут (до 3 токенов), пропуская слова «минут...».
+            // Токен со знаком препинания завершает время.
             let mut parts: Vec<u32> = Vec::new();
-            while j < tokens.len() && parts.len() < 3 {
+            while j < tokens.len() && parts.len() < 3 && !stopped_by_punct {
                 let s = strip_trailing_punct(&tokens[j]);
                 let l = lowercase_word(s);
                 if is_minute_word(&l) {
                     strong = true;
-                    j += 1;
-                    continue;
+                } else if let Some(n) = parse_number_word(&l).or_else(|| s.parse::<u32>().ok()) {
+                    parts.push(n);
+                } else {
+                    break;
                 }
-                match parse_number_word(&l).or_else(|| s.parse::<u32>().ok()) {
-                    Some(n) => {
-                        parts.push(n);
-                        j += 1;
-                    }
-                    None => break,
-                }
+                stopped_by_punct = !trailing_punct(&tokens[j]).is_empty();
+                j += 1;
             }
 
             let compound_minutes = parts.len() >= 2;
@@ -335,13 +324,13 @@ fn replace_time_expressions(tokens: &[String]) -> Vec<String> {
                 && m <= 59
                 && (strong || compound_minutes && h >= 10)
             {
-                result.push(format!("{h:02}:{m:02}"));
+                result.push(format!("{h:02}:{m:02}{}", trailing_punct(&tokens[j - 1])));
                 i = j;
                 continue;
             }
         }
 
-        result.push(tokens[i].clone());
+        result.push(token.clone());
         i += 1;
     }
     result
@@ -358,9 +347,10 @@ fn is_punct(c: char) -> bool {
     matches!(c, '.' | ',' | '!' | '?' | ':' | ';' | '/' | '…')
 }
 
-/// Тире в предложении (длинное «—» и символ «-», которым мы заменяем слово «тире»).
-fn is_dash(c: char) -> bool {
-    c == '\u{2014}' || c == '-'
+/// Открывающие скобки и кавычки: после них не ставится пробел, а первая
+/// буква предложения за ними всё равно становится заглавной.
+fn is_opening(c: char) -> bool {
+    matches!(c, '(' | '[' | '«' | '„' | '"' | '\'')
 }
 
 fn lowercase_word(word: &str) -> String {
@@ -370,24 +360,22 @@ fn lowercase_word(word: &str) -> String {
 }
 
 /// Отделяет от слова завершающую пунктуацию («привет,» -> «привет»).
+/// Если слово целиком состоит из знаков, возвращается как есть.
 fn strip_trailing_punct(word: &str) -> &str {
-    let mut end = word.len();
-    while end > 0 {
-        let c = word[..end].chars().next_back().unwrap();
-        if is_punct(c) || matches!(c, '"' | '\'' | ')') {
-            end -= c.len_utf8();
-        } else {
-            break;
-        }
-    }
-    if end == 0 { word } else { &word[..end] }
+    let stripped = word.trim_end_matches(|c: char| is_punct(c) || matches!(c, '"' | '\'' | ')'));
+    if stripped.is_empty() { word } else { stripped }
+}
+
+/// Завершающая пунктуация слова («привет,» -> «,»).
+fn trailing_punct(word: &str) -> &str {
+    &word[strip_trailing_punct(word).len()..]
 }
 
 /// Приводит слово к «словарному» виду для сравнения: только буквы, цифры
 /// и дефисы, в нижнем регистре.
 fn keep_word_chars(word: &str) -> String {
     word.chars()
-        .filter(|&c| c.is_alphanumeric() || c == '-' || is_dash(c))
+        .filter(|&c| c.is_alphanumeric() || c == '-' || c == '\u{2014}')
         .map(|c| c.to_lowercase().next().unwrap_or(c))
         .collect()
 }
@@ -401,6 +389,25 @@ fn split_words(text: &str) -> Vec<String> {
     text.split_whitespace().map(|w| w.to_string()).collect()
 }
 
+/// Не теряет конец предложения при удалении паразита: «Привет, ну.» ->
+/// «Привет.», а не «Привет,».
+fn keep_sentence_end(result: &mut [String], removed_last: &str) {
+    let ends: String = trailing_punct(removed_last)
+        .chars()
+        .filter(|&c| is_sentence_end(c))
+        .collect();
+    if ends.is_empty() {
+        return;
+    }
+    if let Some(prev) = result.last_mut() {
+        let trimmed_len = prev.trim_end_matches([',', ';', ':']).len();
+        prev.truncate(trimmed_len);
+        if !prev.ends_with(is_sentence_end) {
+            prev.push_str(&ends);
+        }
+    }
+}
+
 /// Удаляет слова-паразиты и повторы слов.
 ///
 /// Идём по словам слева направо: если цепочка слов совпадает с одним из
@@ -408,10 +415,15 @@ fn split_words(text: &str) -> Vec<String> {
 /// пропускается. Также вырезаются случайные повторы одного и того же слова,
 /// характерные для устной речи («я я», «очень очень»).
 fn remove_fillers(tokens: &[String]) -> Vec<String> {
-    let mut phrases: Vec<Vec<String>> = FILLER_PHRASES.iter().map(|p| split_words(p)).collect();
+    // (слова оборота, удалять только если оборот выделен запятой)
+    let mut phrases: Vec<(Vec<String>, bool)> = FILLER_PHRASES
+        .iter()
+        .map(|p| (split_words(p), false))
+        .chain(COMMA_FILLER_PHRASES.iter().map(|p| (split_words(p), true)))
+        .collect();
     // Длинные обороты проверяем раньше, чтобы «ну и вот» распознавался как
     // один оборот, а не как «ну» + «вот».
-    phrases.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    phrases.sort_by_key(|(words, _)| std::cmp::Reverse(words.len()));
 
     let mut result: Vec<String> = Vec::with_capacity(tokens.len());
     let n = tokens.len();
@@ -422,28 +434,31 @@ fn remove_fillers(tokens: &[String]) -> Vec<String> {
         let low = keep_word_chars(stripped);
 
         // Многословный оборот-паразит.
-        let mut matched_phrase = false;
-        for phrase in &phrases {
-            let len = phrase.len();
+        let matched = phrases.iter().find_map(|(words, needs_comma)| {
+            let len = words.len();
             if i + len > n {
-                continue;
+                return None;
             }
-            let same = phrase.iter().enumerate().all(|(k, needle)| {
-                let token_key = keep_word_chars(strip_trailing_punct(&tokens[i + k]));
-                token_key.as_str() == needle.as_str()
+            let same = words.iter().enumerate().all(|(k, needle)| {
+                keep_word_chars(strip_trailing_punct(&tokens[i + k])) == *needle
             });
-            if same {
-                i += len;
-                matched_phrase = true;
-                break;
+            let comma_ok = !needs_comma || trailing_punct(&tokens[i + len - 1]).contains(',');
+            (same && comma_ok).then_some((len, *needs_comma))
+        });
+        if let Some((len, parenthetical)) = matched {
+            // Вводный оборот «, как бы,» убираем вместе с обрамляющими запятыми.
+            if parenthetical && let Some(prev) = result.last_mut() {
+                let trimmed_len = prev.trim_end_matches(',').len();
+                prev.truncate(trimmed_len);
             }
-        }
-        if matched_phrase {
+            keep_sentence_end(&mut result, &tokens[i + len - 1]);
+            i += len;
             continue;
         }
 
         // Одиночный паразит или звук-междометие.
         if FILLER_WORDS.contains(&low.as_str()) || is_sound_word(stripped) {
+            keep_sentence_end(&mut result, &tokens[i]);
             i += 1;
             continue;
         }
@@ -452,7 +467,8 @@ fn remove_fillers(tokens: &[String]) -> Vec<String> {
         let prev = result
             .last()
             .map(|w| keep_word_chars(strip_trailing_punct(w)));
-        if prev.as_deref() == Some(low.as_str()) {
+        if !low.is_empty() && prev.as_deref() == Some(low.as_str()) {
+            keep_sentence_end(&mut result, &tokens[i]);
             i += 1;
             continue;
         }
@@ -464,88 +480,84 @@ fn remove_fillers(tokens: &[String]) -> Vec<String> {
     result
 }
 
+/// Является ли «-» в позиции `idx` тире (отбитым пробелом справа), а не
+/// дефисом внутри слова («кто-то», «из-за») или минусом («-5»).
+fn is_standalone_hyphen(chars: &[char], idx: usize) -> bool {
+    chars.get(idx + 1).is_none_or(|c| c.is_whitespace())
+}
+
 /// Нормализует пунктуацию и регистр во всей строке.
 ///
-/// - убирает лишние пробелы и пробелы перед знаками пунктуации;
+/// - схлопывает лишние пробелы и убирает пробелы перед знаками пунктуации;
 /// - схлопывает повторяющиеся знаки («,,», «!!»);
-/// - оставляет тире с пробелами вокруг;
+/// - отбивает тире пробелами, не трогая дефисы внутри слов;
 /// - ставит заглавную букву в начале каждого предложения;
 /// - добавляет точку в конец, если её нет.
+///
+/// Прочие символы (скобки, кавычки, «%», «+», «=» и т.п.) сохраняются
+/// вместе с исходными пробелами вокруг них.
 fn normalize_punctuation(text: &str) -> String {
-    let mut out: Vec<char> = Vec::with_capacity(text.len() + 4);
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(chars.len() + 4);
     let mut prev: char = '\0';
-    let mut pregap = false;
+    let mut gap = false;
     let mut sentence_start = true;
-    let mut any_word = false;
 
-    for c in text.chars() {
+    for (idx, &c) in chars.iter().enumerate() {
         if c.is_whitespace() {
-            pregap = true;
-            continue;
-        }
-
-        // Повторяющиеся одинаковые знаки пунктуации схлопываем.
-        if is_punct(c) && is_punct(prev) && prev == c {
-            continue;
-        }
-
-        if is_sentence_end(c) {
-            remove_trailing_space(&mut out);
-            out.push(c);
-            prev = c;
-            sentence_start = true;
-            pregap = false;
+            gap = true;
             continue;
         }
 
         if is_punct(c) {
-            remove_trailing_space(&mut out);
-            out.push(c);
-            prev = c;
-            pregap = false;
-            continue;
-        }
-
-        if is_dash(c) {
+            // Повторяющиеся одинаковые знаки пунктуации схлопываем.
+            if c != prev {
+                remove_trailing_space(&mut out);
+                out.push(c);
+                if is_sentence_end(c) {
+                    sentence_start = true;
+                }
+            }
+        } else if c == '\u{2014}' || (c == '-' && is_standalone_hyphen(&chars, idx)) {
             if !out.is_empty() && out.last() != Some(&' ') {
                 out.push(' ');
             }
             out.push(c);
-            // После тире всегда ставим пробел (Whisper пишет «— текст»).
+            // После тире всегда пробел (модель пишет «— текст»).
             out.push(' ');
-            prev = c;
-            sentence_start = false;
-            pregap = false;
-            any_word = true;
-            continue;
-        }
-
-        if c.is_alphanumeric() {
-            // Пробел перед словом.
-            let starts_with_open = matches!(out.last(), Some('(') | Some('"') | Some('\''));
-            if pregap && !starts_with_open && out.last() != Some(&' ') && !out.is_empty() {
+        } else {
+            let after_space_or_open = out.is_empty()
+                || gap
+                || out.last() == Some(&' ')
+                || out.last().is_some_and(|&last| is_opening(last));
+            if gap && out.last().is_some_and(|&last| last != ' ') {
                 out.push(' ');
             }
-
-            let mut ch = c;
-            if sentence_start && c.is_alphabetic() {
-                let upper = c.to_uppercase().next().unwrap_or(c);
-                ch = upper;
+            // Заглавная — только в начале слова: «т.д.» и «3.14» не трогаем.
+            if sentence_start && c.is_alphabetic() && after_space_or_open {
+                out.extend(c.to_uppercase());
+            } else {
+                out.push(c);
             }
-
-            out.push(ch);
-            prev = ch;
-            sentence_start = false;
-            pregap = false;
-            any_word = true;
+            if c.is_alphanumeric() {
+                sentence_start = false;
+            }
         }
+        prev = c;
+        gap = false;
     }
 
-    trim_end_spaces(&mut out);
+    remove_trailing_space(&mut out);
 
-    // Если текст не закончился знаком конца предложения — ставим точку.
-    if any_word && !out.is_empty() && !is_sentence_end(*out.last().unwrap_or(&'.')) {
-        out.push('.');
+    // Текст не закончился знаком конца предложения — ставим точку
+    // (висящие «,», «;», «:» в конце заменяем на неё).
+    if out.iter().any(|c| c.is_alphanumeric()) {
+        while out.last().is_some_and(|&c| matches!(c, ',' | ';' | ':')) {
+            out.pop();
+        }
+        if !out.last().is_some_and(|&c| is_sentence_end(c)) {
+            out.push('.');
+        }
     }
 
     out.into_iter().collect()
@@ -557,31 +569,28 @@ fn remove_trailing_space(out: &mut Vec<char>) {
     }
 }
 
-fn trim_end_spaces(out: &mut Vec<char>) {
-    while out.last() == Some(&' ') {
-        out.pop();
-    }
-}
-
-/// Разбивает текст на предложения (по знакам конца предложения).
+/// Разбивает текст на предложения по знакам конца предложения, за которыми
+/// идёт пробел (точка внутри «3.14» или «т.д.» предложение не делит).
 fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut current = String::new();
+    let mut chars = text.chars().peekable();
 
-    for c in text.chars() {
+    while let Some(c) = chars.next() {
         current.push(c);
-        if is_sentence_end(c) {
-            let s = current.trim().to_string();
+        let at_boundary = chars.peek().is_none_or(|next| next.is_whitespace());
+        if is_sentence_end(c) && at_boundary {
+            let s = current.trim();
             if !s.is_empty() {
-                sentences.push(s);
+                sentences.push(s.to_string());
             }
             current.clear();
         }
     }
 
-    let tail = current.trim().to_string();
+    let tail = current.trim();
     if !tail.is_empty() {
-        sentences.push(tail);
+        sentences.push(tail.to_string());
     }
 
     sentences
@@ -593,49 +602,39 @@ fn split_sentences(text: &str) -> Vec<String> {
 /// Слишком короткий «хвостовой» абзац присоединяется к предыдущему, чтобы
 /// текст не выглядел рваным.
 fn group_paragraphs(sentences: &[String]) -> Vec<String> {
-    if sentences.len() <= 1 {
-        return sentences.to_vec();
-    }
-
     let mut paragraphs: Vec<String> = Vec::new();
     let mut current = String::new();
 
     for sentence in sentences {
-        let candidate_len = current.len() + sentence.len();
+        let candidate_len = current.chars().count() + sentence.chars().count();
         if !current.is_empty() && candidate_len > PARAGRAPH_CHARS {
-            paragraphs.push(current.trim().to_string());
-            current = sentence.clone();
-        } else if current.is_empty() {
-            current = sentence.clone();
-        } else {
-            current.push(' ');
-            current.push_str(sentence);
+            paragraphs.push(std::mem::take(&mut current));
         }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(sentence);
     }
-
-    if !current.trim().is_empty() {
-        paragraphs.push(current.trim().to_string());
+    if !current.is_empty() {
+        paragraphs.push(current);
     }
 
     // Короткий последний абзац приклеиваем к предыдущему.
-    if paragraphs.len() >= 2 {
-        let last = paragraphs.pop().unwrap();
-        if last.chars().count() < 40 && paragraphs.last_mut().is_some() {
-            if let Some(prev) = paragraphs.last_mut() {
-                if !prev.is_empty() {
-                    prev.push(' ');
-                }
-                prev.push_str(&last);
-            }
-        } else {
-            paragraphs.push(last);
-        }
+    if paragraphs.len() >= 2
+        && paragraphs
+            .last()
+            .is_some_and(|last| last.chars().count() < MIN_LAST_PARAGRAPH_CHARS)
+        && let Some(last) = paragraphs.pop()
+        && let Some(prev) = paragraphs.last_mut()
+    {
+        prev.push(' ');
+        prev.push_str(&last);
     }
 
     paragraphs
 }
 
-/// Главная функция пост-обработки: сырой текст из Whisper -> аккуратный текст.
+/// Главная функция пост-обработки: сырой текст модели -> аккуратный текст.
 ///
 /// Если `auto_punctuation == false`, пунктуация не добавляется и не
 /// нормализуется: текст остаётся «как сказан», без точек, заглавных букв
@@ -652,27 +651,19 @@ pub fn postprocess_text(raw: &str, auto_punctuation: bool) -> String {
     let cleaned = remove_fillers(&tokens);
     let joined = cleaned.join(" ");
 
-    if !auto_punctuation {
-        let trimmed = joined.trim().to_string();
-        // В тексте не осталось ни букв, ни цифр (например, были только звуки
-        // и знаки пунктуации) — такой текст не несёт смысла.
-        if trimmed.chars().any(|c| c.is_alphanumeric()) {
-            trimmed
-        } else {
-            String::new()
-        }
-    } else {
-        let normalized = normalize_punctuation(&joined);
-
-        // В тексте не осталось ни букв, ни цифр (например, были только звуки
-        // и знаки пунктуации) — такой текст не несёт смысла.
-        if !normalized.chars().any(|c| c.is_alphanumeric()) {
-            return String::new();
-        }
-
-        let sentences = split_sentences(&normalized);
-        group_paragraphs(&sentences).join("\n\n")
+    // В тексте не осталось ни букв, ни цифр (например, были только звуки
+    // и знаки пунктуации) — такой текст не несёт смысла.
+    if !joined.chars().any(|c| c.is_alphanumeric()) {
+        return String::new();
     }
+
+    if !auto_punctuation {
+        return joined;
+    }
+
+    let normalized = normalize_punctuation(&joined);
+    let sentences = split_sentences(&normalized);
+    group_paragraphs(&sentences).join("\n\n")
 }
 
 #[cfg(test)]
@@ -692,13 +683,30 @@ mod tests {
         assert_eq!(pp("ну вот привет"), "Привет.");
         assert_eq!(pp("привет ну вот как дела"), "Привет как дела.");
         assert_eq!(pp("это типа классная идея"), "Это классная идея.");
-        assert_eq!(pp("ну я короче готов"), "Я готов.");
+        assert_eq!(pp("ну я блин готов"), "Я готов.");
+    }
+
+    #[test]
+    fn keeps_meaningful_verbs_and_comparatives() {
+        assert_eq!(pp("ты знаешь ответ"), "Ты знаешь ответ.");
+        assert_eq!(pp("слушай меня внимательно"), "Слушай меня внимательно.");
+        assert_eq!(pp("этот путь короче"), "Этот путь короче.");
     }
 
     #[test]
     fn removes_sound_words() {
         assert_eq!(pp("э-э я мм думаю"), "Я думаю.");
         assert_eq!(pp("угу ага конечно"), "Конечно.");
+    }
+
+    #[test]
+    fn keeps_conjunction_and_prepositions() {
+        // «а», «о», «у» — союз и предлоги, а не мычание.
+        assert_eq!(pp("я пошёл а он остался"), "Я пошёл а он остался.");
+        assert_eq!(pp("думаю о тебе"), "Думаю о тебе.");
+        assert_eq!(pp("у меня дома"), "У меня дома.");
+        assert_eq!(pp("у тебя всё хорошо"), "У тебя всё хорошо.");
+        assert_eq!(pp("книга у меня"), "Книга у меня.");
     }
 
     #[test]
@@ -710,9 +718,23 @@ mod tests {
 
     #[test]
     fn removes_phrases() {
-        assert_eq!(pp("так сказать это как бы секрет"), "Это секрет.");
+        assert_eq!(pp("так сказать это, как бы, секрет"), "Это секрет.");
         assert_eq!(pp("ну и вот начинаем"), "Начинаем.");
         assert_eq!(pp("ну вот начинаем"), "Начинаем.");
+        assert_eq!(pp("В общем, всё готово"), "Всё готово.");
+    }
+
+    #[test]
+    fn keeps_ambiguous_phrases_without_comma() {
+        assert_eq!(pp("в общем случае решение"), "В общем случае решение.");
+        assert_eq!(pp("как бы ты поступил?"), "Как бы ты поступил?");
+        assert_eq!(pp("это самое важное"), "Это самое важное.");
+    }
+
+    #[test]
+    fn filler_at_sentence_end_keeps_the_period() {
+        assert_eq!(pp("привет, ну. как дела"), "Привет. Как дела.");
+        assert_eq!(pp("готово, короче говоря!"), "Готово!");
     }
 
     #[test]
@@ -720,6 +742,7 @@ mod tests {
         assert_eq!(pp("привет мир"), "Привет мир.");
         assert_eq!(pp("один. два три"), "Один. Два три.");
         assert_eq!(pp("Привет МИР"), "Привет МИР.");
+        assert_eq!(pp("привет мир,"), "Привет мир.");
     }
 
     #[test]
@@ -733,6 +756,57 @@ mod tests {
     fn keeps_dash() {
         assert_eq!(pp("это — важно"), "Это — важно.");
         assert_eq!(pp("я — студент"), "Я — студент.");
+        assert_eq!(pp("я тире студент"), "Я — студент.");
+    }
+
+    #[test]
+    fn keeps_hyphenated_words() {
+        assert_eq!(
+            pp("кто-то пришёл из-за дождя"),
+            "Кто-то пришёл из-за дождя."
+        );
+        assert_eq!(pp("на улице -5 градусов"), "На улице -5 градусов.");
+    }
+
+    #[test]
+    fn keeps_numbers_abbreviations_and_symbols() {
+        assert_eq!(pp("число 3.14 важно"), "Число 3.14 важно.");
+        assert_eq!(pp("яблоки, груши и т.д."), "Яблоки, груши и т.д.");
+        assert_eq!(pp("скидка 50% (примерно)"), "Скидка 50% (примерно).");
+        assert_eq!(pp("2+2=4"), "2+2=4.");
+        assert_eq!(pp("«война и мир» роман"), "«Война и мир» роман.");
+    }
+
+    #[test]
+    fn converts_fractions() {
+        assert_eq!(pp("одна вторая"), "1/2.");
+        assert_eq!(pp("две третьих и три пятых"), "2/3 и 3/5.");
+        assert_eq!(pp("двадцать одна пятая"), "21/5.");
+    }
+
+    #[test]
+    fn ordinals_are_not_fractions() {
+        assert_eq!(pp("двадцать пятое мая"), "Двадцать пятое мая.");
+        assert_eq!(pp("двадцать вторая неделя"), "Двадцать вторая неделя.");
+    }
+
+    #[test]
+    fn converts_time() {
+        assert_eq!(
+            pp("встреча в пятнадцать тридцать четыре"),
+            "Встреча в 15:34."
+        );
+        assert_eq!(pp("в три часа сорок пять"), "В 03:45.");
+        assert_eq!(pp("в пятнадцать тридцать четыре?"), "В 15:34?");
+        assert_eq!(pp("их было двадцать три"), "Их было двадцать три.");
+    }
+
+    #[test]
+    fn time_does_not_cross_punctuation() {
+        assert_eq!(
+            pp("было двенадцать. тридцать пять человек пришли"),
+            "Было двенадцать. Тридцать пять человек пришли."
+        );
     }
 
     #[test]
@@ -740,7 +814,8 @@ mod tests {
         let long = (1..=6u32)
             .map(|i| {
                 format!(
-                    "Предложение номер {i} двухтысячного года является очень длинным и очень содержательным."
+                    "Предложение номер {i} двухтысячного года является очень длинным и \
+                     очень содержательным."
                 )
             })
             .collect::<Vec<_>>()
@@ -750,6 +825,9 @@ mod tests {
             result.contains("\n\n"),
             "длинный текст должен делиться на абзацы: {result}"
         );
+        for paragraph in result.split("\n\n") {
+            assert!(paragraph.chars().count() <= PARAGRAPH_CHARS + 100);
+        }
     }
 
     #[test]
@@ -795,14 +873,6 @@ mod tests {
     fn raw_mode_still_removes_fillers() {
         assert_eq!(pp_raw("ну вот привет"), "привет");
         assert_eq!(pp_raw("э-э я мм думаю"), "я думаю");
-    }
-
-    #[test]
-    fn keeps_preposition_u() {
-        // Одиночное «у» — это предлог («у меня», «у тебя»), его нельзя вырезать.
-        assert_eq!(pp("у меня дома"), "У меня дома.");
-        assert_eq!(pp("у тебя всё хорошо"), "У тебя всё хорошо.");
-        assert_eq!(pp("книга у меня"), "Книга у меня.");
     }
 
     #[test]

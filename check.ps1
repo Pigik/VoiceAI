@@ -1,12 +1,16 @@
 <#
-    Lokalnyi check devaika (dvizhok VoiceAI): fmt + clippy + testy odnoi komandoi.
+    Local check for VoiceAI: rustfmt + clippy + tests in one command.
+    CI (.github/workflows/ci.yml) runs the same steps.
 
-    Note: file is ASCII-only on purpose. PowerShell 5.1 reads UTF-8 files
-    without BOM using the ANSI codepage, which corrupts Cyrillic literals
-    and can break parsing. Messages stay English to keep the script portable.
+    The file is ASCII-only on purpose: Windows PowerShell 5.1 reads UTF-8
+    files without BOM using the ANSI code page, which corrupts Cyrillic text
+    and can break parsing.
 
-    Usage (Windows PowerShell):
+    Usage (PowerShell, from the project root):
         .\check.ps1
+
+    If scripts are blocked by the execution policy:
+        powershell -ExecutionPolicy Bypass -File .\check.ps1
 
     Runs, in order:
       1. cargo fmt --all -- --check
@@ -38,16 +42,23 @@ function Run-Step([string]$name, [scriptblock]$body) {
     }
 }
 
-Run-Step "1/3. Formatting (cargo fmt --check)" {
-    & $cargo fmt --all -- --check
-}
+# Run cargo from the project folder; the caller's current folder is
+# restored at the end.
+Push-Location -LiteralPath $PSScriptRoot
+try {
+    Run-Step "1/3. Formatting (cargo fmt --check)" {
+        & $cargo fmt --all -- --check
+    }
 
-Run-Step "2/3. Static analysis (cargo clippy -D warnings)" {
-    & $cargo clippy --all-targets -- -D warnings
-}
+    Run-Step "2/3. Static analysis (cargo clippy -D warnings)" {
+        & $cargo clippy --all-targets -- -D warnings
+    }
 
-Run-Step "3/3. Tests (cargo test --all-targets)" {
-    & $cargo test --all-targets
+    Run-Step "3/3. Tests (cargo test --all-targets)" {
+        & $cargo test --all-targets
+    }
+} finally {
+    Pop-Location
 }
 
 Write-Host ""

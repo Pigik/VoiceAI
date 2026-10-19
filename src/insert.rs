@@ -7,12 +7,12 @@
 //! Буфер обмена при этом **не используется вообще**:
 //! - нет гонки «восстановленный старый буфер перекрывает текст» — вставляется
 //!   именно то, что нужно;
-//! - буфер пользователя остаётся нетронутым (L-03) — нечего сохранять и
+//! - буфер пользователя остаётся нетронутым — нечего сохранять и
 //!   восстанавливать, не нужна задержка на ожидание чтения буфера приложением;
-//! - пустой текст не «печатается» — ничего не вставляется (L-04).
+//! - пустой текст не «печатается» — ничего не вставляется.
 //!
 //! Многострочный текст вводится как есть: переводы строк превращаются
-//! в нажатие Enter (L-07).
+//! в нажатие Enter.
 
 #![cfg(target_os = "windows")]
 
@@ -43,33 +43,48 @@ fn key_event(vk: u16, scan: u16, flags: u32) -> INPUT {
     }
 }
 
-/// Печатает `text` в приложение под курсором, не трогая буфер обмена.
+/// Превращает текст в последовательность событий клавиатуры.
 ///
-/// Возвращает `Ok(true)` при успехе или сообщение об ошибке.
-pub fn insert_text_at_cursor(text: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    // Пустой текст печатать нечего — сразу успех (L-04).
-    if text.is_empty() {
-        return Ok(true);
-    }
-
-    let _guard = INPUT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    // Для каждого символа — пара событий «нажали / отпустили».
-    // Переходы строк вставляем настоящим Enter, остальное — как Unicode-символ.
-    let mut inputs: Vec<INPUT> = Vec::with_capacity(text.chars().count() * 2);
-    for ch in text.chars() {
+/// Для каждого символа — пара событий «нажали / отпустили». Переводы строк
+/// (`\n`, `\r\n`, `\r`) вставляются одним нажатием Enter, остальные символы —
+/// как Unicode-события. Символы вне базовой плоскости Unicode (эмодзи и т.п.)
+/// занимают в UTF-16 два кода (суррогатную пару) — отправляем оба.
+fn text_to_inputs(text: &str) -> Vec<INPUT> {
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 2);
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
             '\r' | '\n' => {
+                // «\r\n» — один перевод строки, а не два.
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
                 inputs.push(key_event(VK_RETURN, 0, 0));
                 inputs.push(key_event(VK_RETURN, 0, KEYEVENTF_KEYUP));
             }
             c => {
-                inputs.push(key_event(0, c as u16, KEYEVENTF_UNICODE));
-                inputs.push(key_event(0, c as u16, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+                let mut units = [0u16; 2];
+                for &unit in c.encode_utf16(&mut units).iter() {
+                    inputs.push(key_event(0, unit, KEYEVENTF_UNICODE));
+                    inputs.push(key_event(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+                }
             }
         }
     }
+    inputs
+}
 
+/// Печатает `text` в приложение под курсором, не трогая буфер обмена.
+///
+/// Пустой текст ничего не вставляет и считается успехом.
+pub fn insert_text_at_cursor(text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let _guard = INPUT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let inputs = text_to_inputs(text);
     let sent = unsafe {
         SendInput(
             inputs.len() as u32,
@@ -79,17 +94,18 @@ pub fn insert_text_at_cursor(text: &str) -> Result<bool, Box<dyn std::error::Err
     };
 
     if sent != inputs.len() as u32 {
-        // Что-то не прошло (например, события отвергнуты защитой от ввода).
-        // Сообщаем об ошибке — поток транскрибации запишет её в журнал.
+        // Что-то не прошло (например, события отвергнуты защитой от ввода
+        // или активно окно с повышенными правами). Ошибку запишет в журнал
+        // поток транскрибации.
         return Err(std::io::Error::last_os_error().into());
     }
 
-    Ok(true)
+    Ok(())
 }
 
 /// Кладёт `text` в системный буфер обмена.
 ///
-/// Это запасной путь (O-15): если вставка через `SendInput` не удалась
+/// Это запасной путь: если вставка через `SendInput` не удалась
 /// (окно заблокировано, защита от ввода), текст не пропадает — он попадает
 /// в буфер обмена, и пользователь вставляет его вручную (Ctrl+V). Сам
 /// «обычный» путь вставки буфер обмена не использует и не трогает.
@@ -105,30 +121,53 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Достаёт из событий (vk, scan, flags) для проверок.
+    fn describe(inputs: &[INPUT]) -> Vec<(u16, u16, u32)> {
+        inputs
+            .iter()
+            .map(|input| unsafe {
+                let ki = input.Anonymous.ki;
+                (ki.wVk, ki.wScan, ki.dwFlags)
+            })
+            .collect()
+    }
+
     #[test]
     fn empty_text_is_noop() {
-        // L-04: пустой текст ничего не вставляет.
         assert!(insert_text_at_cursor("").is_ok());
+        assert!(text_to_inputs("").is_empty());
     }
 
     #[test]
-    fn unicode_event_uses_scan_code() {
-        // Кириллический символ должен уйти как Unicode-скан-код без виртуальной клавиши.
-        let evt = key_event(0, 'А' as u16, KEYEVENTF_UNICODE);
-        unsafe {
-            assert_eq!(evt.Anonymous.ki.wVk, 0);
-            assert_eq!(evt.Anonymous.ki.wScan, 'А' as u16);
-            assert_eq!(evt.Anonymous.ki.dwFlags, KEYEVENTF_UNICODE);
+    fn unicode_char_uses_scan_code() {
+        // Кириллический символ уходит как Unicode-скан-код без виртуальной клавиши.
+        let events = describe(&text_to_inputs("А"));
+        assert_eq!(
+            events,
+            vec![
+                (0, 'А' as u16, KEYEVENTF_UNICODE),
+                (0, 'А' as u16, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+            ]
+        );
+    }
+
+    #[test]
+    fn newline_variants_produce_single_return() {
+        for text in ["\n", "\r\n", "\r"] {
+            let events = describe(&text_to_inputs(text));
+            assert_eq!(
+                events,
+                vec![(VK_RETURN, 0, 0), (VK_RETURN, 0, KEYEVENTF_KEYUP)],
+                "перевод строки {text:?} должен давать ровно одно нажатие Enter"
+            );
         }
     }
 
     #[test]
-    fn newline_produces_return_key() {
-        // Перевод строки превращается в нажатие Enter (L-07).
-        let evt = key_event(VK_RETURN, 0, 0);
-        unsafe {
-            assert_eq!(evt.Anonymous.ki.wVk, VK_RETURN);
-            assert_eq!(evt.Anonymous.ki.dwFlags, 0);
-        }
+    fn emoji_is_sent_as_surrogate_pair() {
+        // 😀 = U+1F600 = суррогатная пара D83D DE00: два нажатия и два отпускания.
+        let events = describe(&text_to_inputs("😀"));
+        let scans: Vec<u16> = events.iter().map(|&(_, scan, _)| scan).collect();
+        assert_eq!(scans, vec![0xD83D, 0xD83D, 0xDE00, 0xDE00]);
     }
 }
